@@ -1,0 +1,6 @@
+bot_token: "REPLACE_ME"
+db_path: "./bot.db"
+cache_ttl: "30m"
+log_level: "info"
+allowlist: []
+allow_anonymous_admin: true
