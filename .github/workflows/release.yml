@@ -55,8 +55,11 @@ jobs:
           CGO_ENABLED: 0
         run: |
           VERSION=${{ steps.get_version.outputs.version }}
+          BUILD_TIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          GIT_COMMIT=$(git rev-parse --short HEAD)
+          PKG=github.com/herbertgao/group-limit-bot/internal/version
           go build -trimpath \
-            -ldflags "-s -w -X github.com/herbertgao/group-limit-bot/internal/version.Version=${VERSION}" \
+            -ldflags "-s -w -X ${PKG}.Version=${VERSION} -X ${PKG}.BuildTime=${BUILD_TIME} -X ${PKG}.GitCommit=${GIT_COMMIT}" \
             -o ${{ matrix.artifact_name }} \
             ./cmd/bot
 

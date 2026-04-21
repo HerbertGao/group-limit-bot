@@ -60,6 +60,23 @@ bot 会自动读取群的 linked_chat_id 完成绑定。无需手填任何 ID。
 | `/unbind` | 解除当前群的绑定,清空缓存 |
 | `/status` | 查看当前绑定、缓存命中、近 1h 删除计数、最近错误 |
 
+## CLI 子命令
+
+```bash
+group-limit-bot                # 运行 bot(默认)
+group-limit-bot --config PATH  # 指定配置文件运行
+group-limit-bot version        # 打印版本 + 构建信息(也支持 --version)
+group-limit-bot update         # 查询 GitHub Release,自动下载并原地替换二进制
+group-limit-bot --help         # 显示帮助
+```
+
+`update` 会自动识别当前平台(linux/macOS × amd64/arm64),下载最新版,把旧二进制备份为 `<path>.bak`。如果是 systemd 托管,升级后需要重启服务:
+
+```bash
+sudo /data/group-limit-bot/group-limit-bot update
+sudo systemctl restart group-limit-bot
+```
+
 ## 配置项
 
 | 键 | 环境变量 | 默认 | 说明 |

@@ -2,7 +2,13 @@
 
 BIN := bin/group-limit-bot
 VERSION ?= dev-$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
-LDFLAGS := -s -w -X github.com/herbertgao/group-limit-bot/internal/version.Version=$(VERSION)
+BUILD_TIME ?= $(shell date -u +'%Y-%m-%dT%H:%M:%SZ')
+GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+PKG := github.com/herbertgao/group-limit-bot/internal/version
+LDFLAGS := -s -w \
+	-X $(PKG).Version=$(VERSION) \
+	-X $(PKG).BuildTime=$(BUILD_TIME) \
+	-X $(PKG).GitCommit=$(GIT_COMMIT)
 
 build:
 	go build -trimpath -ldflags='$(LDFLAGS)' -o $(BIN) ./cmd/bot
