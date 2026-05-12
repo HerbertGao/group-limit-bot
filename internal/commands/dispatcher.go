@@ -47,7 +47,9 @@ func isValidBotUsername(s string) bool {
 		return false
 	}
 	first := s[0]
-	if !((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z')) {
+	isLower := first >= 'a' && first <= 'z'
+	isUpper := first >= 'A' && first <= 'Z'
+	if !isLower && !isUpper {
 		return false
 	}
 	for i := 1; i < len(s); i++ {

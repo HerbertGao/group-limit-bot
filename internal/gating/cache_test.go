@@ -80,11 +80,10 @@ func TestCacheSet_SkippedIfDropGroupRaces(t *testing.T) {
 	// then call Set — the real Set will capture the *new* generation, so we
 	// instead assert the DropGroup semantics wipe mem atomically.
 	mc.DropGroup(g)
-	if hit, err := mc.Get(ctx, g, c, u, now); err != nil {
+	// Store row may still exist if no cascade occurred; but the in-memory
+	// entry must be gone. Get falls back to store and may re-hit — tolerate.
+	if _, err := mc.Get(ctx, g, c, u, now); err != nil {
 		t.Fatalf("Get after DropGroup: err=%v", err)
-	} else if hit {
-		// Store row may still exist if no cascade occurred; but the in-memory
-		// entry must be gone. Get falls back to store and may re-hit — tolerate.
 	}
 
 	// Direct generation-guard check: write through a stale genBefore.

@@ -257,7 +257,7 @@ func (s *Store) ListBindings(ctx context.Context) ([]Binding, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []Binding
 	for rows.Next() {
 		var (
@@ -391,7 +391,7 @@ func (s *Store) LoadAllValidVerified(ctx context.Context, now time.Time) ([]Veri
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []VerifiedMember
 	for rows.Next() {
 		var (
