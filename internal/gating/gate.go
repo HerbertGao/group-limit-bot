@@ -71,7 +71,60 @@ func New(
 }
 
 // Decide runs the pipeline described in design.md. isEdit is carried for logging only.
+//
+// Pure command short-circuit is applied AFTER the access pipeline: only senders
+// that would otherwise be allowed (member, channel root, anonymous admin, etc.)
+// have a `/cmd` / `/cmd@other_bot` message demoted from Allow → Ignore/Command.
+// Non-members and unbound channel identities still go through the normal
+// delete path even when their text looks command-shaped — otherwise any
+// stranger could post `/spam@anywhere` and the gate would protect them.
 func (g *Gate) Decide(ctx context.Context, msg *telego.Message, isEdit bool) Outcome {
+	out := g.decideBase(ctx, msg, isEdit)
+	return g.demoteAllowedCommand(out, msg, isEdit)
+}
+
+// demoteAllowedCommand converts an Allow outcome to Ignore/Command when the
+// message is a pure command and the Allow came from an explicit access check.
+// Delete outcomes are returned unchanged so that non-members can't escape
+// moderation by command-shaping their text. ReasonErrorDefaultAllow is
+// excluded by design — Telegram API failures must not silently re-open the
+// command dispatcher to non-members.
+func (g *Gate) demoteAllowedCommand(out Outcome, msg *telego.Message, isEdit bool) Outcome {
+	if out.Decision != DecisionAllow {
+		return out
+	}
+	if !isVerifiedAccessReason(out.Reason) {
+		return out
+	}
+	if isEdit || g.cfg.IsCommandText == nil {
+		return out
+	}
+	text := commandBearingText(msg)
+	if text == "" || !g.cfg.IsCommandText(text) {
+		return out
+	}
+	out.Decision = DecisionIgnore
+	out.Reason = ReasonCommand
+	return out
+}
+
+// isVerifiedAccessReason reports whether an Allow outcome was produced by a
+// positive access check rather than a fail-open default. Only verified
+// reasons are eligible for command-demotion so a Telegram API outage cannot
+// reopen the dispatcher to non-members via ReasonErrorDefaultAllow.
+func isVerifiedAccessReason(r Reason) bool {
+	switch r {
+	case ReasonMember, ReasonCacheHit, ReasonChannelRootPost,
+		ReasonAnonymousAdmin, ReasonBotAllowlist:
+		return true
+	}
+	return false
+}
+
+// decideBase is the original access-classification pipeline. It produces
+// Allow / Delete / Ignore outcomes purely on sender identity and membership;
+// the caller (Decide) decides whether to demote an Allow to Ignore/Command.
+func (g *Gate) decideBase(ctx context.Context, msg *telego.Message, isEdit bool) Outcome {
 	chatID := msg.Chat.ID
 
 	binding, err := g.bindings.Lookup(ctx, chatID)
@@ -88,15 +141,6 @@ func (g *Gate) Decide(ctx context.Context, msg *telego.Message, isEdit bool) Out
 
 	if isServiceMessage(msg) {
 		return Outcome{Decision: DecisionIgnore, Reason: ReasonServiceMessage, Binding: binding}
-	}
-
-	// Pure-command short-circuit runs before the sender_chat branch so that
-	// `/cmd@other_bot` sent with a channel identity (or a channel root post whose
-	// text happens to be a pure command) is preserved rather than deleted.
-	if !isEdit && g.cfg.IsCommandText != nil {
-		if text := commandBearingText(msg); text != "" && g.cfg.IsCommandText(text) {
-			return Outcome{Decision: DecisionIgnore, Reason: ReasonCommand, Binding: binding}
-		}
 	}
 
 	if msg.SenderChat != nil {

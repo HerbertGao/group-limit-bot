@@ -184,11 +184,14 @@ func TestDecide_OtherSenderChatDeleted(t *testing.T) {
 	}
 }
 
-func TestDecide_CommandAsOtherChannelIdentityPreserved(t *testing.T) {
+// Unbound channel identities are deleted regardless of whether their text
+// looks like a command — otherwise any random channel could rebroadcast
+// `/x@anywhere` into the bound group and the gate would protect it.
+func TestDecide_CommandAsOtherChannelIdentityDeleted(t *testing.T) {
 	g, mock, _, _, _ := setup(t)
 	g.cfg.IsCommandText = func(s string) bool { return s == "/status@other_bot" }
 	mock.GetChatMemberFn = func(ctx context.Context, chatID, userID int64) (telegram.Status, error) {
-		t.Fatalf("GetChatMember must not be called for pure command as other channel identity: chat=%d user=%d", chatID, userID)
+		t.Fatalf("GetChatMember must not be called when sender_chat is an unbound channel: chat=%d user=%d", chatID, userID)
 		return telegram.StatusUnknown, nil
 	}
 	msg := &telego.Message{
@@ -198,8 +201,8 @@ func TestDecide_CommandAsOtherChannelIdentityPreserved(t *testing.T) {
 		Text:       "/status@other_bot",
 	}
 	out := g.Decide(context.Background(), msg, false)
-	if out.Decision != DecisionIgnore || out.Reason != ReasonCommand {
-		t.Errorf("got %s/%s, want ignore/command", out.Decision, out.Reason)
+	if out.Decision != DecisionDelete || out.Reason != ReasonOtherSenderChat {
+		t.Errorf("got %s/%s, want delete/other_sender_chat", out.Decision, out.Reason)
 	}
 	if len(mock.GetChatMemberCalls) != 0 {
 		t.Errorf("expected 0 GetChatMember calls, got %d", len(mock.GetChatMemberCalls))
@@ -435,30 +438,55 @@ func TestDecide_ServiceMessageIgnored(t *testing.T) {
 	}
 }
 
-func TestDecide_CommandMessageIgnored(t *testing.T) {
-	g, _, _, _, _ := setup(t)
+// A channel member sending a pure command is demoted from Allow/Member to
+// Ignore/Command so the command dispatcher can handle it without the gate
+// emitting a delete.
+func TestDecide_MemberPureCommandIgnored(t *testing.T) {
+	g, mock, _, _, _ := setup(t)
 	g.cfg.IsCommandText = func(text string) bool { return text == "/status" }
-	out := g.Decide(context.Background(), msgFromUser(tUserNone, "/status"), false)
+	mock.GetChatMemberFn = func(ctx context.Context, chatID, userID int64) (telegram.Status, error) {
+		return telegram.StatusMember, nil
+	}
+	out := g.Decide(context.Background(), msgFromUser(tUserMember, "/status"), false)
 	if out.Decision != DecisionIgnore || out.Reason != ReasonCommand {
-		t.Errorf("got %s/%s", out.Decision, out.Reason)
+		t.Errorf("got %s/%s, want ignore/command", out.Decision, out.Reason)
 	}
 }
 
-func TestDecide_CommandToOtherBotBypassesModeration(t *testing.T) {
+// Regression for the "command-shape bypass": a non-channel-member who sends
+// `/anything@other_bot` (a pure command targeting a different bot) used to
+// short-circuit out of the gate with Ignore/Command and never get deleted.
+// The fix runs the access check first; only Allow outcomes are demoted to
+// Ignore/Command, so non-members still hit Delete/NotMember.
+func TestDecide_NonMemberOtherBotCommandDeleted(t *testing.T) {
 	g, mock, _, _, _ := setup(t)
 	g.cfg.IsCommandText = func(text string) bool {
 		return text == "/status" || text == "/status@other_bot"
 	}
 	mock.GetChatMemberFn = func(ctx context.Context, chatID, userID int64) (telegram.Status, error) {
-		t.Fatalf("GetChatMember must not be called for pure command to other bot: chat=%d user=%d", chatID, userID)
-		return telegram.StatusUnknown, nil
+		return telegram.StatusLeft, nil
 	}
 	out := g.Decide(context.Background(), msgFromUser(tUserNone, "/status@other_bot"), false)
-	if out.Decision != DecisionIgnore || out.Reason != ReasonCommand {
-		t.Errorf("got %s/%s, want ignore/command", out.Decision, out.Reason)
+	if out.Decision != DecisionDelete || out.Reason != ReasonNotMember {
+		t.Errorf("got %s/%s, want delete/not_member", out.Decision, out.Reason)
 	}
-	if len(mock.GetChatMemberCalls) != 0 {
-		t.Errorf("expected 0 GetChatMember calls, got %d", len(mock.GetChatMemberCalls))
+	if len(mock.GetChatMemberCalls) != 1 {
+		t.Errorf("expected 1 GetChatMember call, got %d", len(mock.GetChatMemberCalls))
+	}
+}
+
+// Same fix as above for a registered command (`/bind`): non-members who type
+// `/bind` get deleted by the gate before the dispatcher ever runs, so the bot
+// never replies "仅群创建者..." to a stranger.
+func TestDecide_NonMemberRegisteredCommandDeleted(t *testing.T) {
+	g, mock, _, _, _ := setup(t)
+	g.cfg.IsCommandText = func(text string) bool { return text == "/bind" }
+	mock.GetChatMemberFn = func(ctx context.Context, chatID, userID int64) (telegram.Status, error) {
+		return telegram.StatusLeft, nil
+	}
+	out := g.Decide(context.Background(), msgFromUser(tUserNone, "/bind"), false)
+	if out.Decision != DecisionDelete || out.Reason != ReasonNotMember {
+		t.Errorf("got %s/%s, want delete/not_member", out.Decision, out.Reason)
 	}
 }
 
@@ -586,5 +614,21 @@ func TestDecide_CacheSetFailureDoesNotPopulateMemory(t *testing.T) {
 	hit, _ := cache.Get(ctx, tGroupID, tChannelID, tUserMember, now)
 	if hit {
 		t.Error("cache memory must not be populated when SQLite Set failed")
+	}
+}
+
+// API errors must NOT cause the command demotion to bypass non-member
+// protection. Even when getChatMember fails (default-allow), a pure command
+// stays Allow/ErrorDefaultAllow rather than being demoted to Ignore/Command,
+// so handleUpdate won't dispatch the handler during Telegram outages.
+func TestDecide_APIErrorCommandNotDemoted(t *testing.T) {
+	g, mock, _, _, _ := setup(t)
+	g.cfg.IsCommandText = func(s string) bool { return s == "/probe" }
+	mock.GetChatMemberFn = func(ctx context.Context, chatID, userID int64) (telegram.Status, error) {
+		return telegram.StatusUnknown, errors.New("api outage")
+	}
+	out := g.Decide(context.Background(), msgFromUser(tUserNone, "/probe"), false)
+	if out.Decision != DecisionAllow || out.Reason != ReasonErrorDefaultAllow {
+		t.Errorf("got %s/%s, want allow/error_default_allow", out.Decision, out.Reason)
 	}
 }

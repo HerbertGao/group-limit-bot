@@ -240,25 +240,13 @@ func handleUpdate(
 		return
 	}
 
-	// Dispatch runs before gating: a group admin who is not a channel member
-	// typing `/bind extra` must get a usage reply from the handler rather than
-	// have their command message silently deleted by the gate. Handlers are
-	// responsible for auto-cleanup of rejection replies (see /bind, /unbind,
-	// /status). Pure commands (no trailing text) are still short-circuited out
-	// of the gate via IsCommandText; captions are never commands.
-	// Messages from a chat identity (sender_chat set) are not user commands; let gate classify them.
-	// sender_chat == chat.id → anonymous admin; treat like a user-initiated command for dispatch.
-	isUserLikeSender := msg.SenderChat == nil ||
-		(msg.SenderChat != nil && msg.SenderChat.ID == msg.Chat.ID)
-	if !isEdit && isUserLikeSender {
-		handled, err := disp.Dispatch(ctx, msg)
-		if err != nil && !errors.Is(err, context.Canceled) {
-			log.Warn("command handler error", slog.String("error", err.Error()))
-		}
-		if handled {
-			return
-		}
-	}
+	// Gating runs first so that non-members can't reach the command dispatcher
+	// at all: a non-channel-member sending `/bind` (or any registered command)
+	// gets DecisionDelete from the gate and the dispatcher is never invoked,
+	// preventing the bot from amplifying a stranger's command with a reply.
+	// Only when the gate confirms the sender has access — DecisionIgnore with
+	// ReasonCommand — do we dispatch the handler. The handler is then
+	// responsible for in-handler admin/creator checks.
 	start := time.Now()
 	out := gate.Decide(ctx, msg, isEdit)
 	var userID int64
@@ -266,6 +254,22 @@ func handleUpdate(
 		userID = msg.From.ID
 	}
 	exec.Apply(ctx, msg.Chat.ID, msg.MessageID, userID, out, isEdit, time.Since(start))
+
+	// sender_chat == chat.id → anonymous admin; treat like a user-initiated command for dispatch.
+	isUserLikeSender := msg.SenderChat == nil ||
+		(msg.SenderChat != nil && msg.SenderChat.ID == msg.Chat.ID)
+	// Two ignore reasons still reach the dispatcher:
+	//   ReasonCommand    — pure command from a gate-validated sender in a bound group.
+	//   ReasonNoBinding  — any message in an unbound group; there is no channel to
+	//                      gate against, and the initial /bind from the group creator
+	//                      must reach handleBind to establish the first binding.
+	if !isEdit && isUserLikeSender &&
+		out.Decision == gating.DecisionIgnore &&
+		(out.Reason == gating.ReasonCommand || out.Reason == gating.ReasonNoBinding) {
+		if _, err := disp.Dispatch(ctx, msg); err != nil && !errors.Is(err, context.Canceled) {
+			log.Warn("command handler error", slog.String("error", err.Error()))
+		}
+	}
 }
 
 func cleanupLoop(ctx context.Context, st *store.Store, cache *gating.MemberCache, log *slog.Logger) {

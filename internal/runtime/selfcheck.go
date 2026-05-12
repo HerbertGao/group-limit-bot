@@ -38,8 +38,8 @@ type SelfCheck struct {
 	st  *store.Store
 	log *slog.Logger
 
-	mu          sync.Mutex
-	lastWarned  map[int64]time.Time
+	mu           sync.Mutex
+	lastWarned   map[int64]time.Time
 	warnCooldown time.Duration
 }
 

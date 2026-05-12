@@ -3,8 +3,8 @@ package telegram
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"io"
+	"log/slog"
 	"testing"
 	"time"
 

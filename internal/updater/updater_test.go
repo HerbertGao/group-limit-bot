@@ -19,11 +19,11 @@ func TestCompareVersion(t *testing.T) {
 		{"v2.0.0", "v1.9.9", false},
 		{"v1.2", "v1.2.1", true},
 		{"v1.2.3", "v1.2", false},
-		{"dev", "v0.1.0", true},          // "dev" parses to empty → 0.0.0; real tag wins.
-		{"v0.1.0-rc1", "v0.1.0", false},  // rc1 parses to [0,1,0], equal.
-		{"v1.2.3-rc1", "v1.2.2", false},  // current 1.2.3-rc1 > 1.2.2; reviewer regression.
+		{"dev", "v0.1.0", true},         // "dev" parses to empty → 0.0.0; real tag wins.
+		{"v0.1.0-rc1", "v0.1.0", false}, // rc1 parses to [0,1,0], equal.
+		{"v1.2.3-rc1", "v1.2.2", false}, // current 1.2.3-rc1 > 1.2.2; reviewer regression.
 		{"v1.2.2", "v1.2.3-rc1", true},
-		{"v1.2.3-rc1", "v1.2.3", false},  // rc1 == release under this simplified scheme.
+		{"v1.2.3-rc1", "v1.2.3", false}, // rc1 == release under this simplified scheme.
 	}
 	for _, tc := range cases {
 		got := u.CompareVersion(tc.current, tc.latest)
@@ -58,9 +58,9 @@ func TestParseVersionParts(t *testing.T) {
 		{"1.2.3", []int{1, 2, 3}},
 		{"0.1.0", []int{0, 1, 0}},
 		{"1.2", []int{1, 2}},
-		{"1.2.3-rc1", []int{1, 2, 3}}, // prerelease suffix "-rc1" is stripped per-component.
+		{"1.2.3-rc1", []int{1, 2, 3}},        // prerelease suffix "-rc1" is stripped per-component.
 		{"1.2.3-alpha.4", []int{1, 2, 3, 4}}, // continuing parts still parse leading digits.
-		{"dev-4f650dc", []int{}}, // no numeric head → empty (blocks auto-downgrade).
+		{"dev-4f650dc", []int{}},             // no numeric head → empty (blocks auto-downgrade).
 		{"abc", []int{}},
 		{"", []int{}},
 	}

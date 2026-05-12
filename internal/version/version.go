@@ -6,9 +6,10 @@ import (
 )
 
 // Version / BuildTime / GitCommit are injected at build time via:
-//   go build -ldflags "-X github.com/herbertgao/group-limit-bot/internal/version.Version=vX.Y.Z
-//                      -X github.com/herbertgao/group-limit-bot/internal/version.BuildTime=<iso8601>
-//                      -X github.com/herbertgao/group-limit-bot/internal/version.GitCommit=<sha>"
+//
+//	go build -ldflags "-X github.com/herbertgao/group-limit-bot/internal/version.Version=vX.Y.Z
+//	                   -X github.com/herbertgao/group-limit-bot/internal/version.BuildTime=<iso8601>
+//	                   -X github.com/herbertgao/group-limit-bot/internal/version.GitCommit=<sha>"
 var (
 	Version   = "dev"
 	BuildTime = "unknown"

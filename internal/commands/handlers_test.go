@@ -17,8 +17,8 @@ import (
 )
 
 const (
-	gID  int64 = -1001
-	cID  int64 = -2001
+	gID   int64 = -1001
+	cID   int64 = -2001
 	admin int64 = 100
 	noob  int64 = 200
 	bot   int64 = 999
@@ -192,12 +192,18 @@ func TestBindHandler_RebindingNewChannelClearsCache(t *testing.T) {
 	}
 }
 
-func TestBindHandler_NonCreatorRejected(t *testing.T) {
+// A channel member who is not the group creator must have their /bind
+// silently deleted. The bot used to reply "仅群创建者..." which let
+// spammers force visible bot interactions for 10s; per the new policy the
+// handler removes the command and stays silent.
+func TestBindHandler_NonCreatorSilentlyDeleted(t *testing.T) {
 	_, disp, mock, st := buildDeps(t)
 	mock.GetChatMemberFn = func(ctx context.Context, chatID, userID int64) (telegram.Status, error) {
 		return telegram.StatusAdministrator, nil
 	}
-	handled, err := disp.Dispatch(context.Background(), groupMsg("/bind", noob))
+	msg := groupMsg("/bind", noob)
+	msg.MessageID = 8002
+	handled, err := disp.Dispatch(context.Background(), msg)
 	if err != nil || !handled {
 		t.Fatalf("handled=%v err=%v", handled, err)
 	}
@@ -208,8 +214,11 @@ func TestBindHandler_NonCreatorRejected(t *testing.T) {
 	if b != nil {
 		t.Error("binding should not have been created")
 	}
-	if len(mock.SendMessageCalls) != 1 || !strings.Contains(mock.SendMessageCalls[0].Text, "创建者") {
-		t.Errorf("expected creator-permission reply, got %+v", mock.SendMessageCalls)
+	if len(mock.SendMessageCalls) != 0 {
+		t.Errorf("expected no reply to non-creator /bind, got %+v", mock.SendMessageCalls)
+	}
+	if len(mock.DeleteMessageCalls) != 1 || mock.DeleteMessageCalls[0].MessageID != 8002 {
+		t.Errorf("expected 1 silent delete of command(8002), got %+v", mock.DeleteMessageCalls)
 	}
 }
 
@@ -292,25 +301,10 @@ func TestStatusHandler_OnlyShowsErrorsForCurrentGroup(t *testing.T) {
 	}
 }
 
+// Non-creator rejections no longer reply (silent delete), so the MarkdownV2
+// guarantee only applies to the remaining reply-producing paths: /unbind on
+// an unbound group and the success replies covered elsewhere.
 func TestReplies_AlwaysMarkdownV2(t *testing.T) {
-	// /bind where caller is non-creator -> "仅群创建者..." reply.
-	t.Run("bind non-creator", func(t *testing.T) {
-		_, disp, mock, _ := buildDeps(t)
-		mock.GetChatMemberFn = func(ctx context.Context, chatID, userID int64) (telegram.Status, error) {
-			return telegram.StatusMember, nil
-		}
-		handled, err := disp.Dispatch(context.Background(), groupMsg("/bind", noob))
-		if err != nil || !handled {
-			t.Fatalf("handled=%v err=%v", handled, err)
-		}
-		if len(mock.SendMessageCalls) != 1 {
-			t.Fatalf("expected 1 reply, got %d", len(mock.SendMessageCalls))
-		}
-		if !mock.SendMessageCalls[0].MarkdownV2 {
-			t.Error("bind non-creator reply should be MarkdownV2")
-		}
-	})
-
 	// /unbind on an unbound group -> "当前群未绑定任何频道" reply.
 	t.Run("unbind not-bound", func(t *testing.T) {
 		_, disp, mock, _ := buildDeps(t)
@@ -324,27 +318,6 @@ func TestReplies_AlwaysMarkdownV2(t *testing.T) {
 		}
 		if !mock.SendMessageCalls[0].MarkdownV2 {
 			t.Error("unbind not-bound reply should be MarkdownV2")
-		}
-	})
-
-	// /status where caller is non-creator -> "仅群创建者..." reply.
-	t.Run("status non-creator", func(t *testing.T) {
-		_, disp, mock, st := buildDeps(t)
-		mock.GetChatMemberFn = func(ctx context.Context, chatID, userID int64) (telegram.Status, error) {
-			return telegram.StatusMember, nil
-		}
-		if _, _, err := st.UpsertBinding(context.Background(), store.Binding{GroupChatID: gID, ChannelChatID: cID}); err != nil {
-			t.Fatal(err)
-		}
-		handled, _ := disp.Dispatch(context.Background(), groupMsg("/status", noob))
-		if !handled {
-			t.Fatal("should handle")
-		}
-		if len(mock.SendMessageCalls) != 1 {
-			t.Fatalf("expected 1 reply, got %d", len(mock.SendMessageCalls))
-		}
-		if !mock.SendMessageCalls[0].MarkdownV2 {
-			t.Error("status non-creator reply should be MarkdownV2")
 		}
 	})
 }
@@ -391,155 +364,75 @@ func TestBindHandler_AutoCleanupOnSuccess(t *testing.T) {
 	}
 }
 
-func TestBindHandler_AutoCleanupOnRejection(t *testing.T) {
+// Non-creator rejection of /bind: the command is deleted immediately and
+// nothing is sent. No async cleanup is needed because there's no reply to
+// pair the command with.
+func TestBindHandler_NonCreatorImmediateSilentDelete(t *testing.T) {
 	deps, disp, mock, _ := buildDeps(t)
 	mock.GetChatMemberFn = func(ctx context.Context, chatID, userID int64) (telegram.Status, error) {
 		return telegram.StatusMember, nil
 	}
 	mock.SendMessageFn = func(ctx context.Context, chatID int64, text string, md2 bool) (int, error) {
-		return 9201, nil
-	}
-	deps.CleanupDelay = 20 * time.Millisecond
-
-	msg := groupMsg("/bind", noob)
-	msg.MessageID = 8002
-	handled, err := disp.Dispatch(context.Background(), msg)
-	if err != nil || !handled {
-		t.Fatalf("handled=%v err=%v", handled, err)
-	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		mock.LockForTest()
-		n := len(mock.DeleteMessageCalls)
-		mock.UnlockForTest()
-		if n >= 2 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	mock.LockForTest()
-	defer mock.UnlockForTest()
-	if len(mock.DeleteMessageCalls) != 2 {
-		t.Fatalf("expected 2 DeleteMessage calls (command + reply), got %d: %+v", len(mock.DeleteMessageCalls), mock.DeleteMessageCalls)
-	}
-}
-
-func TestBindHandler_RejectionCleansUpCommandAndReply(t *testing.T) {
-	deps, disp, mock, _ := buildDeps(t)
-	mock.GetChatMemberFn = func(ctx context.Context, chatID, userID int64) (telegram.Status, error) {
-		return telegram.StatusMember, nil
-	}
-	mock.SendMessageFn = func(ctx context.Context, chatID int64, text string, md2 bool) (int, error) {
-		return 9601, nil
+		t.Fatalf("SendMessage must not be called for non-creator /bind, got text=%q", text)
+		return 0, nil
 	}
 	deps.CleanupDelay = 200 * time.Millisecond
 
 	msg := groupMsg("/bind", noob)
 	msg.MessageID = 8301
-	dispatchStart := time.Now()
 	handled, err := disp.Dispatch(context.Background(), msg)
 	if err != nil || !handled {
 		t.Fatalf("handled=%v err=%v", handled, err)
 	}
-	// Rejection path must NOT delete the command synchronously — it should wait
-	// for the scheduled cleanup so operators can correlate reply with command.
-	elapsed := time.Since(dispatchStart)
-	if elapsed > 150*time.Millisecond {
-		t.Fatalf("Dispatch took %v — rejection should not block on synchronous deletion", elapsed)
-	}
+
+	// Deletion is synchronous, so it must already be visible right after Dispatch.
 	mock.LockForTest()
 	immediate := len(mock.DeleteMessageCalls)
+	immediateID := 0
+	if immediate > 0 {
+		immediateID = mock.DeleteMessageCalls[0].MessageID
+	}
 	mock.UnlockForTest()
-	if immediate != 0 {
-		t.Fatalf("expected 0 immediate DeleteMessage calls, got %d", immediate)
+	if immediate != 1 || immediateID != 8301 {
+		t.Fatalf("expected 1 immediate DeleteMessage of command(8301), got %d: %+v", immediate, mock.DeleteMessageCalls)
 	}
 
-	// Both command and reply deletions should fire at ~CleanupDelay.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		mock.LockForTest()
-		n := len(mock.DeleteMessageCalls)
-		mock.UnlockForTest()
-		if n >= 2 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	// Give any rogue cleanup goroutine a chance to fire; nothing more should happen.
+	time.Sleep(300 * time.Millisecond)
 	mock.LockForTest()
 	defer mock.UnlockForTest()
-	if len(mock.DeleteMessageCalls) != 2 {
-		t.Fatalf("expected 2 DeleteMessage calls overall, got %d: %+v", len(mock.DeleteMessageCalls), mock.DeleteMessageCalls)
+	if len(mock.DeleteMessageCalls) != 1 {
+		t.Errorf("expected exactly 1 DeleteMessage total, got %d: %+v", len(mock.DeleteMessageCalls), mock.DeleteMessageCalls)
 	}
-	ids := map[int]bool{mock.DeleteMessageCalls[0].MessageID: true, mock.DeleteMessageCalls[1].MessageID: true}
-	if !ids[8301] || !ids[9601] {
-		t.Errorf("expected both command(8301) and reply(9601), got %+v", mock.DeleteMessageCalls)
+	if len(mock.SendMessageCalls) != 0 {
+		t.Errorf("expected 0 SendMessage calls, got %+v", mock.SendMessageCalls)
 	}
 }
 
-func TestStatusHandler_NonCreatorDenied(t *testing.T) {
+// Non-creator /status is silently deleted, just like /bind.
+func TestStatusHandler_NonCreatorSilentlyDeleted(t *testing.T) {
 	_, disp, mock, st := buildDeps(t)
 	mock.GetChatMemberFn = func(ctx context.Context, chatID, userID int64) (telegram.Status, error) {
 		return telegram.StatusAdministrator, nil
 	}
+	mock.SendMessageFn = func(ctx context.Context, chatID int64, text string, md2 bool) (int, error) {
+		t.Fatalf("SendMessage must not be called for non-creator /status, got text=%q", text)
+		return 0, nil
+	}
 	if _, _, err := st.UpsertBinding(context.Background(), store.Binding{GroupChatID: gID, ChannelChatID: cID}); err != nil {
 		t.Fatal(err)
 	}
-	handled, _ := disp.Dispatch(context.Background(), groupMsg("/status", noob))
+	msg := groupMsg("/status", noob)
+	msg.MessageID = 8101
+	handled, _ := disp.Dispatch(context.Background(), msg)
 	if !handled {
 		t.Fatal("should handle")
 	}
-	if len(mock.SendMessageCalls) != 1 {
-		t.Fatalf("expected 1 reply")
+	if len(mock.SendMessageCalls) != 0 {
+		t.Errorf("expected no reply, got %+v", mock.SendMessageCalls)
 	}
-	if !strings.Contains(mock.SendMessageCalls[0].Text, "创建者") {
-		t.Errorf("expected creator-permission rejection, got %s", mock.SendMessageCalls[0].Text)
-	}
-}
-
-func TestStatusHandler_AutoCleanupOnRejection(t *testing.T) {
-	deps, disp, mock, st := buildDeps(t)
-	mock.GetChatMemberFn = func(ctx context.Context, chatID, userID int64) (telegram.Status, error) {
-		return telegram.StatusMember, nil
-	}
-	mock.SendMessageFn = func(ctx context.Context, chatID int64, text string, md2 bool) (int, error) {
-		return 9301, nil
-	}
-	if _, _, err := st.UpsertBinding(context.Background(), store.Binding{GroupChatID: gID, ChannelChatID: cID}); err != nil {
-		t.Fatal(err)
-	}
-	deps.CleanupDelay = 20 * time.Millisecond
-
-	msg := groupMsg("/status", noob)
-	msg.MessageID = 8101
-	handled, err := disp.Dispatch(context.Background(), msg)
-	if err != nil || !handled {
-		t.Fatalf("handled=%v err=%v", handled, err)
-	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		mock.LockForTest()
-		n := len(mock.DeleteMessageCalls)
-		mock.UnlockForTest()
-		if n >= 2 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	mock.LockForTest()
-	defer mock.UnlockForTest()
-	if len(mock.DeleteMessageCalls) != 2 {
-		t.Fatalf("expected 2 DeleteMessage calls (command + reply), got %d: %+v", len(mock.DeleteMessageCalls), mock.DeleteMessageCalls)
-	}
-	ids := map[int]bool{
-		mock.DeleteMessageCalls[0].MessageID: true,
-		mock.DeleteMessageCalls[1].MessageID: true,
-	}
-	if !ids[8101] || !ids[9301] {
-		t.Errorf("expected cleanup to cover command(8101) and reply(9301), got %+v", mock.DeleteMessageCalls)
+	if len(mock.DeleteMessageCalls) != 1 || mock.DeleteMessageCalls[0].MessageID != 8101 {
+		t.Errorf("expected 1 silent delete of command(8101), got %+v", mock.DeleteMessageCalls)
 	}
 }
 
@@ -703,4 +596,3 @@ func TestStatusHandler_NoCleanupOnSuccess(t *testing.T) {
 		t.Fatalf("expected 0 DeleteMessage calls on successful /status, got %d: %+v", len(mock.DeleteMessageCalls), mock.DeleteMessageCalls)
 	}
 }
-

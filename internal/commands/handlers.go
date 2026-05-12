@@ -61,8 +61,10 @@ func (d *Deps) handleBind(ctx context.Context, msg *telego.Message, args string)
 		d.scheduleCleanup(chatID, msg.MessageID, replyID)
 		return nil
 	case errors.Is(err, binding.ErrCallerNotAdmin):
-		replyID, _ := d.replyText(ctx, chatID, "仅群创建者可执行本命令")
-		d.scheduleCleanup(chatID, msg.MessageID, replyID)
+		// Channel members who aren't the group creator have passed the gate
+		// but have no business binding/unbinding — silently delete their
+		// command so the bot doesn't become a megaphone replying to them.
+		d.silentDelete(ctx, chatID, msg.MessageID)
 		return nil
 	case errors.Is(err, binding.ErrNoLinkedChannel):
 		replyID, _ := d.replyText(ctx, chatID, "当前群未关联讨论频道。请先在对应频道设置中将本群设为 discussion group。")
@@ -129,8 +131,7 @@ func (d *Deps) handleUnbind(ctx context.Context, msg *telego.Message, _ string) 
 	err := d.BindSvc.Unbind(ctx, chatID, msg.From.ID)
 	switch {
 	case errors.Is(err, binding.ErrCallerNotAdmin):
-		replyID, _ := d.replyText(ctx, chatID, "仅群创建者可执行本命令")
-		d.scheduleCleanup(chatID, msg.MessageID, replyID)
+		d.silentDelete(ctx, chatID, msg.MessageID)
 	case errors.Is(err, binding.ErrNotBound):
 		replyID, _ := d.replyText(ctx, chatID, "当前群未绑定任何频道")
 		d.scheduleCleanup(chatID, msg.MessageID, replyID)
@@ -169,8 +170,7 @@ func (d *Deps) handleStatus(ctx context.Context, msg *telego.Message, _ string) 
 		return nil
 	}
 	if !callerStatus.IsCreator() {
-		replyID, _ := d.replyText(ctx, chatID, "仅群创建者可执行本命令")
-		d.scheduleCleanup(chatID, msg.MessageID, replyID)
+		d.silentDelete(ctx, chatID, msg.MessageID)
 		return nil
 	}
 
@@ -272,6 +272,22 @@ func (d *Deps) reply(ctx context.Context, chatID int64, text string, markdownV2 
 // replyText sends a plain Chinese text reply, escaped for MarkdownV2 consistency.
 func (d *Deps) replyText(ctx context.Context, chatID int64, text string) (int, error) {
 	return d.reply(ctx, chatID, telegram.EscapeMarkdownV2(text), true)
+}
+
+// silentDelete removes a command message synchronously without sending any
+// reply. Used for non-creator rejections on /bind, /unbind, /status so the
+// bot doesn't broadcast an interaction with the unauthorized sender.
+// Failures are logged at warning level — if the bot has lost delete
+// permission, unauthorized commands stay visible and operators need a
+// signal louder than debug to notice.
+func (d *Deps) silentDelete(ctx context.Context, chatID int64, messageID int) {
+	if err := d.TG.DeleteMessage(ctx, chatID, messageID); err != nil {
+		d.Log.Warn("silent delete failed",
+			slog.Int64("chat_id", chatID),
+			slog.Int("message_id", messageID),
+			slog.String("error", err.Error()),
+		)
+	}
 }
 
 // scheduleCleanup asynchronously deletes (chatID, messageIDs...) after

@@ -12,12 +12,12 @@ import (
 
 // User-facing errors. Use errors.Is to compare.
 var (
-	ErrNotGroup              = errors.New("bind command must be run inside a group or supergroup")
-	ErrCallerNotAdmin        = errors.New("caller is not the group creator")
-	ErrNoLinkedChannel       = errors.New("this group has no linked discussion channel — link it in the channel settings first")
-	ErrBotNotChannelAdmin    = errors.New("bot is not an administrator in the linked channel")
+	ErrNotGroup               = errors.New("bind command must be run inside a group or supergroup")
+	ErrCallerNotAdmin         = errors.New("caller is not the group creator")
+	ErrNoLinkedChannel        = errors.New("this group has no linked discussion channel — link it in the channel settings first")
+	ErrBotNotChannelAdmin     = errors.New("bot is not an administrator in the linked channel")
 	ErrBotCannotModerateGroup = errors.New("bot is missing admin delete permission in the discussion group")
-	ErrNotBound              = errors.New("this group is not bound to any channel")
+	ErrNotBound               = errors.New("this group is not bound to any channel")
 )
 
 type Service struct {
