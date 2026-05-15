@@ -596,3 +596,145 @@ func TestStatusHandler_NoCleanupOnSuccess(t *testing.T) {
 		t.Fatalf("expected 0 DeleteMessage calls on successful /status, got %d: %+v", len(mock.DeleteMessageCalls), mock.DeleteMessageCalls)
 	}
 }
+
+// ---- /allowbot, /disallowbot ----
+
+func seedBinding(t *testing.T, st *store.Store) {
+	t.Helper()
+	if _, _, err := st.UpsertBinding(context.Background(), store.Binding{
+		GroupChatID: gID, ChannelChatID: cID, BoundByUserID: admin, BoundAt: time.Unix(0, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAllowBot_CreatorAdds(t *testing.T) {
+	deps, disp, mock, st := buildDeps(t)
+	deps.GroupAllowlist = gating.NewGroupAllowlist(st, quietLogger())
+	stubAllAdminAndLinked(mock)
+	seedBinding(t, st)
+	mock.ResolveUsernameFn = func(ctx context.Context, username string) (*telegram.ChatInfo, error) {
+		return &telegram.ChatInfo{ID: 555, Username: "goodbot", Type: "private"}, nil
+	}
+	handled, err := disp.Dispatch(context.Background(), groupMsg("/allowbot @goodbot", admin))
+	if !handled || err != nil {
+		t.Fatalf("dispatch handled=%v err=%v", handled, err)
+	}
+	got, _ := st.ListAllowedBots(context.Background(), gID)
+	if len(got) != 1 || got[0].BotUserID != 555 {
+		t.Errorf("expected bot 555 allowlisted, got %+v", got)
+	}
+}
+
+func TestAllowBot_Idempotent(t *testing.T) {
+	deps, disp, mock, st := buildDeps(t)
+	deps.GroupAllowlist = gating.NewGroupAllowlist(st, quietLogger())
+	stubAllAdminAndLinked(mock)
+	seedBinding(t, st)
+	mock.ResolveUsernameFn = func(ctx context.Context, username string) (*telegram.ChatInfo, error) {
+		return &telegram.ChatInfo{ID: 555, Username: "goodbot", Type: "private"}, nil
+	}
+	_, _ = disp.Dispatch(context.Background(), groupMsg("/allowbot @goodbot", admin))
+	_, _ = disp.Dispatch(context.Background(), groupMsg("/allowbot @goodbot", admin))
+	got, _ := st.ListAllowedBots(context.Background(), gID)
+	if len(got) != 1 {
+		t.Errorf("duplicate /allowbot must be idempotent, got %d rows", len(got))
+	}
+	mock.LockForTest()
+	defer mock.UnlockForTest()
+	last := mock.SendMessageCalls[len(mock.SendMessageCalls)-1].Text
+	if !strings.Contains(last, "已在") {
+		t.Errorf("second add reply should say already-present, got %q", last)
+	}
+}
+
+func TestDisallowBot_Removes(t *testing.T) {
+	deps, disp, mock, st := buildDeps(t)
+	deps.GroupAllowlist = gating.NewGroupAllowlist(st, quietLogger())
+	stubAllAdminAndLinked(mock)
+	seedBinding(t, st)
+	if _, err := st.AllowBot(context.Background(), gID, 555, "goodbot", admin, time.Unix(0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	mock.ResolveUsernameFn = func(ctx context.Context, username string) (*telegram.ChatInfo, error) {
+		return &telegram.ChatInfo{ID: 555, Username: "goodbot", Type: "private"}, nil
+	}
+	handled, err := disp.Dispatch(context.Background(), groupMsg("/disallowbot @goodbot", admin))
+	if !handled || err != nil {
+		t.Fatalf("dispatch handled=%v err=%v", handled, err)
+	}
+	got, _ := st.ListAllowedBots(context.Background(), gID)
+	if len(got) != 0 {
+		t.Errorf("expected empty allowlist after /disallowbot, got %+v", got)
+	}
+}
+
+func TestAllowBot_NonCreatorRejected(t *testing.T) {
+	_, disp, mock, st := buildDeps(t)
+	stubAllAdminAndLinked(mock)
+	seedBinding(t, st)
+	mock.ResolveUsernameFn = func(ctx context.Context, username string) (*telegram.ChatInfo, error) {
+		return &telegram.ChatInfo{ID: 555, Username: "goodbot"}, nil
+	}
+	if _, err := disp.Dispatch(context.Background(), groupMsg("/allowbot @goodbot", noob)); err != nil {
+		t.Fatalf("dispatch err=%v", err)
+	}
+	got, _ := st.ListAllowedBots(context.Background(), gID)
+	if len(got) != 0 {
+		t.Errorf("non-creator must not modify allowlist, got %+v", got)
+	}
+}
+
+func TestAllowBot_ResolveFailureWritesNothing(t *testing.T) {
+	_, disp, mock, st := buildDeps(t)
+	stubAllAdminAndLinked(mock)
+	seedBinding(t, st)
+	mock.ResolveUsernameFn = func(ctx context.Context, username string) (*telegram.ChatInfo, error) {
+		return nil, errors.New("chat not found")
+	}
+	if _, err := disp.Dispatch(context.Background(), groupMsg("/allowbot @nope", admin)); err != nil {
+		t.Fatalf("dispatch err=%v", err)
+	}
+	got, _ := st.ListAllowedBots(context.Background(), gID)
+	if len(got) != 0 {
+		t.Errorf("resolve failure must write nothing, got %+v", got)
+	}
+}
+
+func TestAllowBot_NonPositiveIDRejected(t *testing.T) {
+	_, disp, mock, st := buildDeps(t)
+	stubAllAdminAndLinked(mock)
+	seedBinding(t, st)
+	mock.ResolveUsernameFn = func(ctx context.Context, username string) (*telegram.ChatInfo, error) {
+		return &telegram.ChatInfo{ID: -100123, Type: "channel", Username: "somechannel"}, nil
+	}
+	if _, err := disp.Dispatch(context.Background(), groupMsg("/allowbot @somechannel", admin)); err != nil {
+		t.Fatalf("dispatch err=%v", err)
+	}
+	got, _ := st.ListAllowedBots(context.Background(), gID)
+	if len(got) != 0 {
+		t.Errorf("non-positive id (channel) must be rejected, got %+v", got)
+	}
+}
+
+func TestStatusHandler_ShowsGroupBotAllowlist(t *testing.T) {
+	deps, disp, mock, st := buildDeps(t)
+	_ = deps
+	stubAllAdminAndLinked(mock)
+	seedBinding(t, st)
+	if _, err := st.AllowBot(context.Background(), gID, 555, "goodbot", admin, time.Unix(0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := disp.Dispatch(context.Background(), groupMsg("/status", admin)); err != nil {
+		t.Fatalf("dispatch err=%v", err)
+	}
+	mock.LockForTest()
+	defer mock.UnlockForTest()
+	if len(mock.SendMessageCalls) == 0 {
+		t.Fatal("expected a status reply")
+	}
+	report := mock.SendMessageCalls[len(mock.SendMessageCalls)-1].Text
+	if !strings.Contains(report, "goodbot") {
+		t.Errorf("/status report should list group bot allowlist, got %q", report)
+	}
+}

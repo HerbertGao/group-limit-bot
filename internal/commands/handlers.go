@@ -19,22 +19,25 @@ import (
 
 // Deps wires everything the admin command handlers need.
 type Deps struct {
-	BindSvc *binding.Service
-	TG      telegram.Client
-	Store   *store.Store
-	Metrics *metrics.Registry
-	Cache   *gating.MemberCache
-	Log     *slog.Logger
+	BindSvc        *binding.Service
+	TG             telegram.Client
+	Store          *store.Store
+	Metrics        *metrics.Registry
+	Cache          *gating.MemberCache
+	GroupAllowlist *gating.GroupAllowlist
+	Log            *slog.Logger
 	// CleanupDelay controls auto-deletion of /bind and /unbind command + reply
 	// messages. Zero or negative disables cleanup entirely (useful for tests).
 	CleanupDelay time.Duration
 }
 
-// Register attaches /bind, /unbind, and /status to the dispatcher.
+// Register attaches /bind, /unbind, /status, /allowbot, /disallowbot to the dispatcher.
 func (d *Deps) Register(disp *Dispatcher) {
 	disp.Register("bind", d.handleBind)
 	disp.Register("unbind", d.handleUnbind)
 	disp.Register("status", d.handleStatus)
+	disp.RegisterArg("allowbot", d.handleAllowBot)
+	disp.RegisterArg("disallowbot", d.handleDisallowBot)
 }
 
 // --------- /bind ---------
@@ -225,6 +228,14 @@ func (d *Deps) handleStatus(ctx context.Context, msg *telego.Message, _ string) 
 		}
 	}
 
+	allowedBots, err := d.Store.ListAllowedBots(ctx, chatID)
+	if err != nil {
+		d.Log.Error("status: list allowed bots", slog.Int64("group_id", chatID), slog.String("error", err.Error()))
+		replyID, _ := d.replyText(ctx, chatID, "内部错误,读取 bot 白名单失败")
+		d.scheduleCleanup(chatID, msg.MessageID, replyID)
+		return err
+	}
+
 	chRefEsc := telegram.EscapeMarkdownV2(channelTitle)
 	if channelRef != "" {
 		chRefEsc = fmt.Sprintf("[%s](https://t.me/%s)", telegram.EscapeMarkdownV2(channelTitle), channelRef)
@@ -244,6 +255,14 @@ func (d *Deps) handleStatus(ctx context.Context, msg *telego.Message, _ string) 
 			fmt.Fprintf(&b2, "\\- %s\n", l)
 		}
 	}
+	if len(allowedBots) == 0 {
+		fmt.Fprintf(&b2, "群级 bot 白名单: _无_\n")
+	} else {
+		fmt.Fprintf(&b2, "群级 bot 白名单:\n")
+		for _, ab := range allowedBots {
+			fmt.Fprintf(&b2, "\\- @%s \\(`%d`\\)\n", telegram.EscapeMarkdownV2(ab.BotUsername), ab.BotUserID)
+		}
+	}
 	if _, err := d.reply(ctx, chatID, b2.String(), true); err != nil {
 		d.Log.Error("status: send report failed",
 			slog.Int64("group_id", chatID),
@@ -252,6 +271,139 @@ func (d *Deps) handleStatus(ctx context.Context, msg *telego.Message, _ string) 
 		return fmt.Errorf("status reply: %w", err)
 	}
 	return nil
+}
+
+// --------- /allowbot, /disallowbot ---------
+
+func (d *Deps) handleAllowBot(ctx context.Context, msg *telego.Message, args string) error {
+	chatID := msg.Chat.ID
+	if _, ok := d.requireBoundGroupCreator(ctx, msg); !ok {
+		return nil
+	}
+	botUserID, botUsername, ok := d.resolveBotArg(ctx, chatID, msg, "/allowbot", args)
+	if !ok {
+		return nil
+	}
+	created, err := d.Store.AllowBot(ctx, chatID, botUserID, botUsername, msg.From.ID, time.Now())
+	if err != nil {
+		d.Log.Error("allowbot: store", slog.Int64("group_id", chatID), slog.String("error", err.Error()))
+		replyID, _ := d.replyText(ctx, chatID, "内部错误,写入 bot 白名单失败")
+		d.scheduleCleanup(chatID, msg.MessageID, replyID)
+		return err
+	}
+	if d.GroupAllowlist != nil {
+		d.GroupAllowlist.Invalidate(chatID)
+	}
+	text := fmt.Sprintf("已将 @%s 加入本群 bot 白名单。", botUsername)
+	if !created {
+		text = fmt.Sprintf("@%s 已在本群 bot 白名单。", botUsername)
+	}
+	replyID, _ := d.replyText(ctx, chatID, text)
+	d.scheduleCleanup(chatID, msg.MessageID, replyID)
+	return nil
+}
+
+func (d *Deps) handleDisallowBot(ctx context.Context, msg *telego.Message, args string) error {
+	chatID := msg.Chat.ID
+	if _, ok := d.requireBoundGroupCreator(ctx, msg); !ok {
+		return nil
+	}
+	botUserID, botUsername, ok := d.resolveBotArg(ctx, chatID, msg, "/disallowbot", args)
+	if !ok {
+		return nil
+	}
+	removed, err := d.Store.DisallowBot(ctx, chatID, botUserID)
+	if err != nil {
+		d.Log.Error("disallowbot: store", slog.Int64("group_id", chatID), slog.String("error", err.Error()))
+		replyID, _ := d.replyText(ctx, chatID, "内部错误,移除 bot 白名单失败")
+		d.scheduleCleanup(chatID, msg.MessageID, replyID)
+		return err
+	}
+	if d.GroupAllowlist != nil {
+		d.GroupAllowlist.Invalidate(chatID)
+	}
+	text := fmt.Sprintf("已将 @%s 从本群 bot 白名单移除。", botUsername)
+	if !removed {
+		text = fmt.Sprintf("@%s 不在本群 bot 白名单。", botUsername)
+	}
+	replyID, _ := d.replyText(ctx, chatID, text)
+	d.scheduleCleanup(chatID, msg.MessageID, replyID)
+	return nil
+}
+
+// requireBoundGroupCreator validates that a command runs inside a bound
+// discussion group and is invoked by that group's creator. On failure it has
+// already sent the appropriate reply / silent-delete and returns ok=false.
+func (d *Deps) requireBoundGroupCreator(ctx context.Context, msg *telego.Message) (*store.Binding, bool) {
+	chatID := msg.Chat.ID
+	if msg.Chat.Type != "group" && msg.Chat.Type != "supergroup" {
+		replyID, _ := d.replyText(ctx, chatID, "请在评论群内执行本命令")
+		d.scheduleCleanup(chatID, msg.MessageID, replyID)
+		return nil, false
+	}
+	if msg.From == nil {
+		d.silentDelete(ctx, chatID, msg.MessageID)
+		return nil, false
+	}
+	callerStatus, err := d.TG.GetChatMember(ctx, chatID, msg.From.ID)
+	if err != nil {
+		d.Log.Warn("command: getChatMember caller failed", slog.String("error", err.Error()))
+		replyID, _ := d.replyText(ctx, chatID, "无法校验创建者身份,请稍后重试")
+		d.scheduleCleanup(chatID, msg.MessageID, replyID)
+		return nil, false
+	}
+	if !callerStatus.IsCreator() {
+		d.silentDelete(ctx, chatID, msg.MessageID)
+		return nil, false
+	}
+	b, err := d.Store.GetBinding(ctx, chatID)
+	if err != nil {
+		d.Log.Error("command: load binding", slog.Int64("group_id", chatID), slog.String("error", err.Error()))
+		replyID, _ := d.replyText(ctx, chatID, "内部错误,读取绑定失败")
+		d.scheduleCleanup(chatID, msg.MessageID, replyID)
+		return nil, false
+	}
+	if b == nil {
+		replyID, _ := d.replyText(ctx, chatID, "当前群未绑定任何频道")
+		d.scheduleCleanup(chatID, msg.MessageID, replyID)
+		return nil, false
+	}
+	return b, true
+}
+
+// resolveBotArg resolves the bot targeted by /allowbot or /disallowbot, from a
+// reply-to a bot's message or from the @username argument. On any failure it
+// sends an error reply and returns ok=false.
+func (d *Deps) resolveBotArg(ctx context.Context, chatID int64, msg *telego.Message, cmd, args string) (botID int64, username string, ok bool) {
+	if r := msg.ReplyToMessage; r != nil && r.From != nil && r.From.IsBot {
+		return r.From.ID, r.From.Username, true
+	}
+	name := strings.TrimSpace(args)
+	if i := strings.IndexAny(name, " \t\n\r"); i >= 0 {
+		name = name[:i]
+	}
+	name = strings.TrimPrefix(name, "@")
+	if name == "" {
+		replyID, _ := d.replyText(ctx, chatID, fmt.Sprintf("用法: %s @bot用户名 (或回复某 bot 的消息执行)", cmd))
+		d.scheduleCleanup(chatID, msg.MessageID, replyID)
+		return 0, "", false
+	}
+	info, err := d.TG.ResolveUsername(ctx, name)
+	if err != nil {
+		d.Log.Warn("resolve bot username failed", slog.String("username", name), slog.String("error", err.Error()))
+		replyID, _ := d.replyText(ctx, chatID, fmt.Sprintf("无法解析用户名 @%s,请确认拼写正确。", name))
+		d.scheduleCleanup(chatID, msg.MessageID, replyID)
+		return 0, "", false
+	}
+	if info.ID <= 0 {
+		replyID, _ := d.replyText(ctx, chatID, fmt.Sprintf("@%s 不是用户/bot(可能是频道或群),无法加入 bot 白名单。", name))
+		d.scheduleCleanup(chatID, msg.MessageID, replyID)
+		return 0, "", false
+	}
+	if info.Username != "" {
+		name = info.Username
+	}
+	return info.ID, name, true
 }
 
 // --------- helpers ---------

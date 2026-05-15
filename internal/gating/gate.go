@@ -24,6 +24,9 @@ type Config struct {
 	TTL                 time.Duration
 	BotAllowlist        map[int64]bool
 	AllowAnonymousAdmin bool
+	// GroupAllowlist resolves the per-group bot allowlist. Nil is valid and
+	// means only the global BotAllowlist applies.
+	GroupAllowlist *GroupAllowlist
 	// IsCommandText returns true if the given message text should be treated as a bot command.
 	// Used to short-circuit the command message out of the gating pipeline.
 	IsCommandText func(text string) bool
@@ -35,6 +38,11 @@ type Outcome struct {
 	Reason   Reason
 	Binding  *store.Binding
 	CacheHit bool
+
+	// Guest-bot fields, set only when Reason == ReasonGuestBot.
+	GuestReply       bool  // true when this outcome classified a guest-bot reply
+	GuestSummonMsgID int   // reply_to_message.message_id of the summon; 0 if absent
+	GuestCallerID    int64 // guest_bot_caller_user.id; 0 when the caller is not a user
 }
 
 // Gate runs the decision pipeline.
@@ -143,6 +151,14 @@ func (g *Gate) decideBase(ctx context.Context, msg *telego.Message, isEdit bool)
 		return Outcome{Decision: DecisionIgnore, Reason: ReasonServiceMessage, Binding: binding}
 	}
 
+	// Guest-bot reply detection runs at the front of the pipeline — before the
+	// sender_chat branch, the bot-allowlist short-circuit and getChatMember —
+	// so a guest reply that also carries sender_chat cannot be mis-classified
+	// as a channel root post or escape via another branch.
+	if isGuestReply(msg) {
+		return g.decideGuest(ctx, msg, binding)
+	}
+
 	if msg.SenderChat != nil {
 		if msg.SenderChat.ID == binding.ChannelChatID {
 			return Outcome{Decision: DecisionAllow, Reason: ReasonChannelRootPost, Binding: binding}
@@ -166,7 +182,7 @@ func (g *Gate) decideBase(ctx context.Context, msg *telego.Message, isEdit bool)
 	if from.ID == g.tg.Me().ID {
 		return Outcome{Decision: DecisionAllow, Reason: ReasonBotAllowlist, Binding: binding}
 	}
-	if from.IsBot && g.cfg.BotAllowlist != nil && g.cfg.BotAllowlist[from.ID] {
+	if from.IsBot && g.botAllowed(ctx, binding.GroupChatID, from.ID) {
 		return Outcome{Decision: DecisionAllow, Reason: ReasonBotAllowlist, Binding: binding}
 	}
 	// Defensive: genuine anonymous admin messages always carry sender_chat and are handled above.
@@ -274,6 +290,49 @@ func commandBearingText(msg *telego.Message) string {
 		return ""
 	}
 	return s
+}
+
+// botAllowed reports whether botID is allowed in groupID via the global
+// allowlist or the group's per-group allowlist.
+func (g *Gate) botAllowed(ctx context.Context, groupID, botID int64) bool {
+	if g.cfg.BotAllowlist != nil && g.cfg.BotAllowlist[botID] {
+		return true
+	}
+	return g.cfg.GroupAllowlist.Allowed(ctx, groupID, botID)
+}
+
+// isGuestReply reports whether msg is a reply produced by a Telegram guest bot.
+// The deterministic markers are the guest_bot_caller_user / guest_bot_caller_chat
+// fields and guest_query_id; any one being set identifies a guest reply.
+func isGuestReply(m *telego.Message) bool {
+	return m.GuestBotCallerUser != nil || m.GuestBotCallerChat != nil || m.GuestQueryID != ""
+}
+
+// decideGuest classifies a guest-bot reply. A reply from a bot in the effective
+// allowlist (global ∪ per-group, plus the guardian bot itself) is allowed;
+// otherwise it is deleted, carrying the summon message id and the caller id so
+// the executor can also remove the summon and punish the summoner.
+func (g *Gate) decideGuest(ctx context.Context, msg *telego.Message, binding *store.Binding) Outcome {
+	var botID int64
+	if msg.From != nil {
+		botID = msg.From.ID
+	}
+	if botID != 0 && (botID == g.tg.Me().ID || g.botAllowed(ctx, binding.GroupChatID, botID)) {
+		return Outcome{Decision: DecisionAllow, Reason: ReasonBotAllowlist, Binding: binding}
+	}
+	out := Outcome{
+		Decision:   DecisionDelete,
+		Reason:     ReasonGuestBot,
+		Binding:    binding,
+		GuestReply: true,
+	}
+	if msg.ReplyToMessage != nil {
+		out.GuestSummonMsgID = msg.ReplyToMessage.MessageID
+	}
+	if msg.GuestBotCallerUser != nil {
+		out.GuestCallerID = msg.GuestBotCallerUser.ID
+	}
+	return out
 }
 
 // isServiceMessage returns true for Telegram service messages that should be ignored

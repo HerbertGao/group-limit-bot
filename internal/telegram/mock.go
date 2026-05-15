@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // MockClient records calls and delegates to configurable stub functions.
@@ -16,6 +17,9 @@ type MockClient struct {
 	DeleteMessageFn          func(ctx context.Context, chatID int64, messageID int) error
 	SendMessageFn            func(ctx context.Context, chatID int64, text string, markdownV2 bool) (int, error)
 	GetChatFn                func(ctx context.Context, chatID int64) (*ChatInfo, error)
+	ResolveUsernameFn        func(ctx context.Context, username string) (*ChatInfo, error)
+	RestrictChatMemberFn     func(ctx context.Context, chatID, userID int64, until time.Time) error
+	BanChatMemberFn          func(ctx context.Context, chatID, userID int64) error
 	DeleteWebhookFn          func(ctx context.Context) error
 
 	mu sync.Mutex
@@ -31,7 +35,14 @@ type MockClient struct {
 		Text       string
 		MarkdownV2 bool
 	}
-	GetChatCalls       []int64
+	GetChatCalls         []int64
+	ResolveUsernameCalls []string
+	RestrictCalls        []struct {
+		ChatID, UserID int64
+	}
+	BanCalls []struct {
+		ChatID, UserID int64
+	}
 	DeleteWebhookCalls int
 }
 
@@ -101,6 +112,36 @@ func (m *MockClient) GetChat(ctx context.Context, chatID int64) (*ChatInfo, erro
 		return nil, fmt.Errorf("mock: GetChat not stubbed")
 	}
 	return m.GetChatFn(ctx, chatID)
+}
+
+func (m *MockClient) ResolveUsername(ctx context.Context, username string) (*ChatInfo, error) {
+	m.mu.Lock()
+	m.ResolveUsernameCalls = append(m.ResolveUsernameCalls, username)
+	m.mu.Unlock()
+	if m.ResolveUsernameFn == nil {
+		return nil, fmt.Errorf("mock: ResolveUsername not stubbed")
+	}
+	return m.ResolveUsernameFn(ctx, username)
+}
+
+func (m *MockClient) RestrictChatMember(ctx context.Context, chatID, userID int64, until time.Time) error {
+	m.mu.Lock()
+	m.RestrictCalls = append(m.RestrictCalls, struct{ ChatID, UserID int64 }{chatID, userID})
+	m.mu.Unlock()
+	if m.RestrictChatMemberFn == nil {
+		return nil
+	}
+	return m.RestrictChatMemberFn(ctx, chatID, userID, until)
+}
+
+func (m *MockClient) BanChatMember(ctx context.Context, chatID, userID int64) error {
+	m.mu.Lock()
+	m.BanCalls = append(m.BanCalls, struct{ ChatID, UserID int64 }{chatID, userID})
+	m.mu.Unlock()
+	if m.BanChatMemberFn == nil {
+		return nil
+	}
+	return m.BanChatMemberFn(ctx, chatID, userID)
 }
 
 func (m *MockClient) DeleteWebhook(ctx context.Context) error {

@@ -20,6 +20,10 @@ type Dispatcher struct {
 
 	mu       sync.RWMutex
 	handlers map[string]Handler
+	// argCmds holds commands that accept trailing arguments. Commands NOT in
+	// this set are "pure": an invocation with trailing text falls through to
+	// the gating pipeline instead of being dispatched.
+	argCmds map[string]bool
 }
 
 func NewDispatcher(botUsername string, log *slog.Logger) *Dispatcher {
@@ -27,16 +31,27 @@ func NewDispatcher(botUsername string, log *slog.Logger) *Dispatcher {
 		botUsername: strings.ToLower(botUsername),
 		log:         log,
 		handlers:    make(map[string]Handler),
+		argCmds:     make(map[string]bool),
 	}
 }
 
-// Register binds cmd (e.g. "bind") to h. cmd is normalized to lowercase and
-// may be provided with or without a leading slash.
+// Register binds cmd (e.g. "bind") to h as a PURE command (no trailing args).
+// cmd is normalized to lowercase and may be provided with or without a leading slash.
 func (d *Dispatcher) Register(cmd string, h Handler) {
 	cmd = strings.ToLower(strings.TrimPrefix(cmd, "/"))
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.handlers[cmd] = h
+}
+
+// RegisterArg binds cmd to h as an ARGUMENT-accepting command: invocations
+// with trailing text (e.g. `/allowbot @x`) are dispatched to h with args set.
+func (d *Dispatcher) RegisterArg(cmd string, h Handler) {
+	cmd = strings.ToLower(strings.TrimPrefix(cmd, "/"))
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.handlers[cmd] = h
+	d.argCmds[cmd] = true
 }
 
 // isValidBotUsername reports whether s is a plausible Telegram bot username
@@ -127,17 +142,22 @@ func (d *Dispatcher) Matches(text string) bool {
 // be deleted as ordinary user text.
 func (d *Dispatcher) IsPureCommand(text string) bool {
 	cmd, args, toThisBot, ok := d.parse(text)
-	if !ok || args != "" {
+	if !ok {
 		return false
 	}
 	if !toThisBot {
-		// `/cmd@other_bot` — a pure command to a different bot. Let that bot handle it.
-		return true
+		// `/cmd@other_bot` — a command to a different bot. Only the bare form
+		// (no trailing text) is treated as a command; let that bot handle it.
+		return args == ""
 	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	_, reg := d.handlers[cmd]
-	return reg
+	if !reg {
+		return false
+	}
+	// Pure commands must carry no trailing args; arg-commands accept either.
+	return d.argCmds[cmd] || args == ""
 }
 
 // Dispatch routes the message to the appropriate handler. STRICT: only pure
@@ -147,13 +167,19 @@ func (d *Dispatcher) IsPureCommand(text string) bool {
 // media messages are never treated as commands.
 func (d *Dispatcher) Dispatch(ctx context.Context, msg *telego.Message) (handled bool, err error) {
 	cmd, args, toThisBot, ok := d.parse(msg.Text)
-	if !ok || !toThisBot || args != "" {
+	if !ok || !toThisBot {
 		return false, nil
 	}
 	d.mu.RLock()
 	h, reg := d.handlers[cmd]
+	isArg := d.argCmds[cmd]
 	d.mu.RUnlock()
 	if !reg {
+		return false, nil
+	}
+	// Pure commands with trailing text fall through to gating as ordinary user
+	// text; arg-commands are dispatched regardless of whether args are present.
+	if !isArg && args != "" {
 		return false, nil
 	}
 	return true, h(ctx, msg, args)

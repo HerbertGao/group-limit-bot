@@ -26,6 +26,15 @@ type VerifiedMember struct {
 	ExpiresAt     time.Time
 }
 
+// AllowedBot is a per-group bot allowlist entry.
+type AllowedBot struct {
+	GroupChatID int64
+	BotUserID   int64
+	BotUsername string
+	AddedBy     int64
+	AddedAt     time.Time
+}
+
 type Store struct {
 	db *sql.DB
 }
@@ -117,6 +126,24 @@ INSERT OR IGNORE INTO binding_epochs (group_chat_id, last_epoch)
 SELECT group_chat_id, epoch FROM bindings;
 `
 
+const schemaV5 = `
+CREATE TABLE IF NOT EXISTS group_bot_allowlist (
+  group_chat_id INTEGER NOT NULL,
+  bot_user_id   INTEGER NOT NULL,
+  bot_username  TEXT NOT NULL DEFAULT '',
+  added_by      INTEGER NOT NULL,
+  added_at      INTEGER NOT NULL,
+  PRIMARY KEY (group_chat_id, bot_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS guest_violations (
+  group_chat_id INTEGER NOT NULL,
+  user_id       INTEGER NOT NULL,
+  count         INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (group_chat_id, user_id)
+);
+`
+
 func (s *Store) migrate(ctx context.Context) error {
 	var v int
 	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
@@ -154,6 +181,15 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("apply schema v4: %w", err)
 		}
 		if _, err := s.db.ExecContext(ctx, "PRAGMA user_version = 4"); err != nil {
+			return fmt.Errorf("set user_version: %w", err)
+		}
+		v = 4
+	}
+	if v < 5 {
+		if _, err := s.db.ExecContext(ctx, schemaV5); err != nil {
+			return fmt.Errorf("apply schema v5: %w", err)
+		}
+		if _, err := s.db.ExecContext(ctx, "PRAGMA user_version = 5"); err != nil {
 			return fmt.Errorf("set user_version: %w", err)
 		}
 	}
@@ -295,6 +331,14 @@ func (s *Store) DeleteBinding(ctx context.Context, groupID int64) (bool, error) 
 			`DELETE FROM verified_members WHERE group_chat_id = ?`, groupID); err != nil {
 			return false, err
 		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM group_bot_allowlist WHERE group_chat_id = ?`, groupID); err != nil {
+			return false, err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM guest_violations WHERE group_chat_id = ?`, groupID); err != nil {
+			return false, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, err
@@ -405,4 +449,111 @@ func (s *Store) LoadAllValidVerified(ctx context.Context, now time.Time) ([]Veri
 		out = append(out, v)
 	}
 	return out, rows.Err()
+}
+
+// ---- Group bot allowlist ----
+
+// AllowBot inserts a per-group allowlist entry. It is idempotent: if the bot is
+// already allowed in the group, the existing row is left untouched and
+// created=false is returned.
+func (s *Store) AllowBot(ctx context.Context, groupID, botUserID int64, botUsername string, addedBy int64, addedAt time.Time) (created bool, err error) {
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO group_bot_allowlist (group_chat_id, bot_user_id, bot_username, added_by, added_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(group_chat_id, bot_user_id) DO NOTHING`,
+		groupID, botUserID, botUsername, addedBy, addedAt.Unix(),
+	)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// DisallowBot removes a per-group allowlist entry. Returns true if a row was removed.
+func (s *Store) DisallowBot(ctx context.Context, groupID, botUserID int64) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM group_bot_allowlist WHERE group_chat_id = ? AND bot_user_id = ?`,
+		groupID, botUserID,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// ListAllowedBots returns the per-group allowlist entries for a single group,
+// ordered by added_at.
+func (s *Store) ListAllowedBots(ctx context.Context, groupID int64) ([]AllowedBot, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT group_chat_id, bot_user_id, bot_username, added_by, added_at
+		 FROM group_bot_allowlist WHERE group_chat_id = ? ORDER BY added_at`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []AllowedBot
+	for rows.Next() {
+		var (
+			b  AllowedBot
+			ts int64
+		)
+		if err := rows.Scan(&b.GroupChatID, &b.BotUserID, &b.BotUsername, &b.AddedBy, &ts); err != nil {
+			return nil, err
+		}
+		b.AddedAt = time.Unix(ts, 0)
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// ---- Guest summon violations ----
+
+// IncrementGuestViolation atomically increments the violation count for
+// (groupID, userID) by 1 and returns the new count.
+func (s *Store) IncrementGuestViolation(ctx context.Context, groupID, userID int64) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO guest_violations (group_chat_id, user_id, count) VALUES (?, ?, 1)
+		 ON CONFLICT(group_chat_id, user_id) DO UPDATE SET count = count + 1`,
+		groupID, userID,
+	); err != nil {
+		return 0, err
+	}
+	var count int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT count FROM guest_violations WHERE group_chat_id = ? AND user_id = ?`,
+		groupID, userID,
+	).Scan(&count); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// GetGuestViolation returns the current violation count for (groupID, userID); 0 if none.
+func (s *Store) GetGuestViolation(ctx context.Context, groupID, userID int64) (int64, error) {
+	var count int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT count FROM guest_violations WHERE group_chat_id = ? AND user_id = ?`,
+		groupID, userID,
+	).Scan(&count)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return count, err
 }

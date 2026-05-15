@@ -632,3 +632,127 @@ func TestDecide_APIErrorCommandNotDemoted(t *testing.T) {
 		t.Errorf("got %s/%s, want allow/error_default_allow", out.Decision, out.Reason)
 	}
 }
+
+// ---- guest-bot detection & per-group allowlist ----
+
+func guestReplyMsg(botID int64) *telego.Message {
+	return &telego.Message{
+		MessageID:          20,
+		Chat:               telego.Chat{ID: tGroupID, Type: "supergroup"},
+		From:               &telego.User{ID: botID, IsBot: true},
+		GuestBotCallerUser: &telego.User{ID: tUserMember, IsBot: false},
+		ReplyToMessage:     &telego.Message{MessageID: 19},
+		Text:               "buy now",
+	}
+}
+
+func TestDecide_GuestReply_UnauthorizedDeleted(t *testing.T) {
+	g, _, _, _, _ := setup(t)
+	out := g.Decide(context.Background(), guestReplyMsg(8888), false)
+	if out.Decision != DecisionDelete || out.Reason != ReasonGuestBot {
+		t.Fatalf("got %v/%v, want delete/guest_bot", out.Decision, out.Reason)
+	}
+	if !out.GuestReply || out.GuestSummonMsgID != 19 || out.GuestCallerID != tUserMember {
+		t.Errorf("guest fields: %+v", out)
+	}
+}
+
+func TestDecide_GuestReply_GlobalAllowlisted(t *testing.T) {
+	g, _, _, _, _ := setup(t)
+	g.cfg.BotAllowlist = map[int64]bool{8888: true}
+	out := g.Decide(context.Background(), guestReplyMsg(8888), false)
+	if out.Decision != DecisionAllow {
+		t.Fatalf("allowlisted guest bot should be allowed, got %v/%v", out.Decision, out.Reason)
+	}
+}
+
+func TestDecide_GuestReply_GroupAllowlisted(t *testing.T) {
+	g, _, _, _, st := setup(t)
+	g.cfg.GroupAllowlist = NewGroupAllowlist(st, testLogger())
+	if _, err := st.AllowBot(context.Background(), tGroupID, 8888, "x", 1, time.Unix(0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	out := g.Decide(context.Background(), guestReplyMsg(8888), false)
+	if out.Decision != DecisionAllow {
+		t.Fatalf("group-allowlisted guest bot should be allowed, got %v/%v", out.Decision, out.Reason)
+	}
+}
+
+func TestDecide_GuestReply_WithSenderChatStillDeleted(t *testing.T) {
+	g, _, _, _, _ := setup(t)
+	m := guestReplyMsg(8888)
+	m.SenderChat = &telego.Chat{ID: tChannelID, Type: "channel"} // equals bound channel
+	out := g.Decide(context.Background(), m, false)
+	if out.Decision != DecisionDelete || out.Reason != ReasonGuestBot {
+		t.Fatalf("guest reply with sender_chat must be guest_bot delete, got %v/%v", out.Decision, out.Reason)
+	}
+}
+
+func TestDecide_GuestReply_ChatCallerNotCounted(t *testing.T) {
+	g, _, _, _, _ := setup(t)
+	m := guestReplyMsg(8888)
+	m.GuestBotCallerUser = nil
+	m.GuestBotCallerChat = &telego.Chat{ID: -555, Type: "channel"}
+	out := g.Decide(context.Background(), m, false)
+	if out.Decision != DecisionDelete || out.Reason != ReasonGuestBot {
+		t.Fatalf("got %v/%v", out.Decision, out.Reason)
+	}
+	if out.GuestCallerID != 0 {
+		t.Errorf("GuestCallerID must be 0 when caller is a chat, got %d", out.GuestCallerID)
+	}
+}
+
+func TestDecide_GuestReply_EditedStillDetected(t *testing.T) {
+	g, _, _, _, _ := setup(t)
+	out := g.Decide(context.Background(), guestReplyMsg(8888), true)
+	if out.Decision != DecisionDelete || out.Reason != ReasonGuestBot {
+		t.Fatalf("edited guest reply must still be detected, got %v/%v", out.Decision, out.Reason)
+	}
+}
+
+func TestDecide_GuestReply_QueryIDOnly(t *testing.T) {
+	g, _, _, _, _ := setup(t)
+	m := guestReplyMsg(8888)
+	m.GuestBotCallerUser = nil
+	m.GuestQueryID = "q123"
+	out := g.Decide(context.Background(), m, false)
+	if out.Decision != DecisionDelete || out.Reason != ReasonGuestBot {
+		t.Fatalf("guest_query_id alone must trigger detection, got %v/%v", out.Decision, out.Reason)
+	}
+}
+
+func TestDecide_GroupBotAllowlist_Hit(t *testing.T) {
+	g, _, _, _, st := setup(t)
+	g.cfg.GroupAllowlist = NewGroupAllowlist(st, testLogger())
+	if _, err := st.AllowBot(context.Background(), tGroupID, 555, "x", 1, time.Unix(0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	botMsg := &telego.Message{
+		MessageID: 11, Chat: telego.Chat{ID: tGroupID, Type: "supergroup"},
+		From: &telego.User{ID: 555, IsBot: true}, Text: "hi",
+	}
+	out := g.Decide(context.Background(), botMsg, false)
+	if out.Decision != DecisionAllow || out.Reason != ReasonBotAllowlist {
+		t.Fatalf("group-allowlisted bot should be allowed, got %v/%v", out.Decision, out.Reason)
+	}
+}
+
+func TestDecide_GroupBotAllowlist_Isolation(t *testing.T) {
+	g, mock, _, _, st := setup(t)
+	g.cfg.GroupAllowlist = NewGroupAllowlist(st, testLogger())
+	// bot 555 allowed only in a different group
+	if _, err := st.AllowBot(context.Background(), -9999, 555, "x", 1, time.Unix(0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	mock.GetChatMemberFn = func(ctx context.Context, chatID, userID int64) (telegram.Status, error) {
+		return telegram.StatusLeft, nil
+	}
+	botMsg := &telego.Message{
+		MessageID: 11, Chat: telego.Chat{ID: tGroupID, Type: "supergroup"},
+		From: &telego.User{ID: 555, IsBot: true}, Text: "hi",
+	}
+	out := g.Decide(context.Background(), botMsg, false)
+	if out.Decision != DecisionDelete {
+		t.Fatalf("bot allowed only in another group must not be allowed here, got %v/%v", out.Decision, out.Reason)
+	}
+}

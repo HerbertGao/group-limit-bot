@@ -38,4 +38,5 @@ const (
 	ReasonMediaGroupDedup   Reason = "media_group_dedup"
 	ReasonErrorDefaultAllow Reason = "error_default_allow"
 	ReasonMissingSender     Reason = "missing_sender"
+	ReasonGuestBot          Reason = "guest_bot"
 )

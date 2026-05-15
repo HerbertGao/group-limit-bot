@@ -69,22 +69,29 @@ func Run(ctx context.Context, configPath string) error {
 	for _, id := range cfg.BotAllowlist {
 		botAllow[id] = true
 	}
+	groupAllow := gating.NewGroupAllowlist(st, log)
 	gate := gating.New(bindSvc, cache, dedup, tg, reg, log, gating.Config{
 		TTL:                 cfg.CacheTTL,
 		BotAllowlist:        botAllow,
 		AllowAnonymousAdmin: cfg.AllowAnonymousAdmin,
+		GroupAllowlist:      groupAllow,
 		IsCommandText:       disp.IsPureCommand,
 	})
-	exec := gating.NewExecutor(tg, reg, log)
+	exec := gating.NewExecutor(tg, reg, log, st, gating.GuestPunishPolicy{
+		MuteThreshold: cfg.GuestMuteThreshold,
+		BanThreshold:  cfg.GuestBanThreshold,
+		MuteDuration:  cfg.GuestMuteDuration,
+	})
 
 	deps := &commands.Deps{
-		BindSvc:      bindSvc,
-		TG:           tg,
-		Store:        st,
-		Metrics:      reg,
-		Cache:        cache,
-		Log:          log,
-		CleanupDelay: 10 * time.Second,
+		BindSvc:        bindSvc,
+		TG:             tg,
+		Store:          st,
+		Metrics:        reg,
+		Cache:          cache,
+		GroupAllowlist: groupAllow,
+		Log:            log,
+		CleanupDelay:   10 * time.Second,
 	}
 	deps.Register(disp)
 

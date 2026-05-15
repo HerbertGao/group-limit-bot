@@ -18,6 +18,10 @@ type Config struct {
 	LogLevel            string
 	BotAllowlist        []int64
 	AllowAnonymousAdmin bool
+	// Guest-bot summoner punishment policy.
+	GuestMuteThreshold int           // violation count at which the summoner is muted (>= 2)
+	GuestMuteDuration  time.Duration // how long restrictChatMember mutes the summoner
+	GuestBanThreshold  int           // violation count at which the summoner is banned (> GuestMuteThreshold)
 }
 
 type rawConfig struct {
@@ -28,6 +32,9 @@ type rawConfig struct {
 	Allowlist           *[]int64 `yaml:"allowlist"`
 	BotAllowlist        *[]int64 `yaml:"bot_allowlist"` // deprecated, fallback only
 	AllowAnonymousAdmin *bool    `yaml:"allow_anonymous_admin"`
+	GuestMuteThreshold  *int     `yaml:"guest_mute_threshold"`
+	GuestMuteDuration   *string  `yaml:"guest_mute_duration"`
+	GuestBanThreshold   *int     `yaml:"guest_ban_threshold"`
 }
 
 func defaults() *Config {
@@ -36,6 +43,9 @@ func defaults() *Config {
 		CacheTTL:            30 * time.Minute,
 		LogLevel:            "info",
 		AllowAnonymousAdmin: true,
+		GuestMuteThreshold:  2,
+		GuestMuteDuration:   24 * time.Hour,
+		GuestBanThreshold:   4,
 	}
 }
 
@@ -81,6 +91,19 @@ func loadWithGetenv(path string, getenv func(string) string, readFile func(strin
 			if raw.AllowAnonymousAdmin != nil {
 				c.AllowAnonymousAdmin = *raw.AllowAnonymousAdmin
 			}
+			if raw.GuestMuteThreshold != nil {
+				c.GuestMuteThreshold = *raw.GuestMuteThreshold
+			}
+			if raw.GuestMuteDuration != nil && *raw.GuestMuteDuration != "" {
+				d, err := time.ParseDuration(*raw.GuestMuteDuration)
+				if err != nil {
+					return nil, fmt.Errorf("parse guest_mute_duration: %w", err)
+				}
+				c.GuestMuteDuration = d
+			}
+			if raw.GuestBanThreshold != nil {
+				c.GuestBanThreshold = *raw.GuestBanThreshold
+			}
 		case errors.Is(err, os.ErrNotExist):
 			// ok — env may still supply everything
 		default:
@@ -124,9 +147,39 @@ func loadWithGetenv(path string, getenv func(string) string, readFile func(strin
 		}
 		c.AllowAnonymousAdmin = b
 	}
+	if v := getenv("BOT_GUEST_MUTE_THRESHOLD"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("parse BOT_GUEST_MUTE_THRESHOLD: %w", err)
+		}
+		c.GuestMuteThreshold = n
+	}
+	if v := getenv("BOT_GUEST_MUTE_DURATION"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("parse BOT_GUEST_MUTE_DURATION: %w", err)
+		}
+		c.GuestMuteDuration = d
+	}
+	if v := getenv("BOT_GUEST_BAN_THRESHOLD"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("parse BOT_GUEST_BAN_THRESHOLD: %w", err)
+		}
+		c.GuestBanThreshold = n
+	}
 
 	if c.BotToken == "" {
 		return nil, errors.New("bot_token is required (config.yaml or env BOT_TOKEN)")
+	}
+	// Punishment thresholds must guarantee "first violation is never punished":
+	// the mute threshold must be at least 2, and ban must escalate strictly above mute.
+	if c.GuestMuteThreshold < 2 {
+		return nil, fmt.Errorf("guest_mute_threshold must be >= 2, got %d", c.GuestMuteThreshold)
+	}
+	if c.GuestBanThreshold <= c.GuestMuteThreshold {
+		return nil, fmt.Errorf("guest_ban_threshold (%d) must be greater than guest_mute_threshold (%d)",
+			c.GuestBanThreshold, c.GuestMuteThreshold)
 	}
 	return c, nil
 }

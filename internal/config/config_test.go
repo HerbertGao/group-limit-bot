@@ -167,3 +167,65 @@ allowlist: [9]
 		t.Errorf("BotAllowlist = %v, want [9]", c.BotAllowlist)
 	}
 }
+
+func TestLoad_GuestPunishmentDefaults(t *testing.T) {
+	path := writeTempYAML(t, "bot_token: t\n")
+	c, err := loadFromFakeEnv(t, path, nil)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if c.GuestMuteThreshold != 2 {
+		t.Errorf("default GuestMuteThreshold = %d, want 2", c.GuestMuteThreshold)
+	}
+	if c.GuestBanThreshold != 4 {
+		t.Errorf("default GuestBanThreshold = %d, want 4", c.GuestBanThreshold)
+	}
+	if c.GuestMuteDuration != 24*time.Hour {
+		t.Errorf("default GuestMuteDuration = %v, want 24h", c.GuestMuteDuration)
+	}
+}
+
+func TestLoad_GuestPunishmentFromYAML(t *testing.T) {
+	path := writeTempYAML(t, `
+bot_token: t
+guest_mute_threshold: 3
+guest_mute_duration: 12h
+guest_ban_threshold: 6
+`)
+	c, err := loadFromFakeEnv(t, path, nil)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if c.GuestMuteThreshold != 3 || c.GuestBanThreshold != 6 || c.GuestMuteDuration != 12*time.Hour {
+		t.Errorf("guest config not loaded: %+v", c)
+	}
+}
+
+func TestLoad_GuestPunishmentEnvOverride(t *testing.T) {
+	path := writeTempYAML(t, "bot_token: t\n")
+	c, err := loadFromFakeEnv(t, path, map[string]string{
+		"BOT_GUEST_MUTE_THRESHOLD": "5",
+		"BOT_GUEST_BAN_THRESHOLD":  "9",
+		"BOT_GUEST_MUTE_DURATION":  "1h",
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if c.GuestMuteThreshold != 5 || c.GuestBanThreshold != 9 || c.GuestMuteDuration != time.Hour {
+		t.Errorf("env override failed: %+v", c)
+	}
+}
+
+func TestLoad_RejectsMuteThresholdBelowTwo(t *testing.T) {
+	path := writeTempYAML(t, "bot_token: t\nguest_mute_threshold: 1\n")
+	if _, err := loadFromFakeEnv(t, path, nil); err == nil {
+		t.Fatal("expected load to fail when guest_mute_threshold < 2")
+	}
+}
+
+func TestLoad_RejectsBanNotAboveMute(t *testing.T) {
+	path := writeTempYAML(t, "bot_token: t\nguest_mute_threshold: 3\nguest_ban_threshold: 3\n")
+	if _, err := loadFromFakeEnv(t, path, nil); err == nil {
+		t.Fatal("expected load to fail when guest_ban_threshold <= guest_mute_threshold")
+	}
+}

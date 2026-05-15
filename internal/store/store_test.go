@@ -682,3 +682,143 @@ func TestBindings_List(t *testing.T) {
 		t.Errorf("expected 2, got %d", len(got))
 	}
 }
+
+func TestGroupBotAllowlist_CRUDAndIdempotency(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+
+	created, err := s.AllowBot(ctx, -100, 555, "adbot", 1, time.Unix(10, 0))
+	if err != nil {
+		t.Fatalf("allow: %v", err)
+	}
+	if !created {
+		t.Error("first AllowBot should report created=true")
+	}
+
+	created, err = s.AllowBot(ctx, -100, 555, "adbot", 1, time.Unix(20, 0))
+	if err != nil {
+		t.Fatalf("allow again: %v", err)
+	}
+	if created {
+		t.Error("duplicate AllowBot should be idempotent (created=false)")
+	}
+
+	got, err := s.ListAllowedBots(ctx, -100)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != 1 || got[0].BotUserID != 555 || got[0].BotUsername != "adbot" {
+		t.Errorf("unexpected list: %+v", got)
+	}
+
+	removed, err := s.DisallowBot(ctx, -100, 555)
+	if err != nil {
+		t.Fatalf("disallow: %v", err)
+	}
+	if !removed {
+		t.Error("DisallowBot should report removed=true")
+	}
+	got, _ = s.ListAllowedBots(ctx, -100)
+	if len(got) != 0 {
+		t.Errorf("expected empty after disallow, got %+v", got)
+	}
+
+	removed, err = s.DisallowBot(ctx, -100, 555)
+	if err != nil {
+		t.Fatalf("disallow missing: %v", err)
+	}
+	if removed {
+		t.Error("DisallowBot on missing entry should report removed=false")
+	}
+}
+
+func TestGroupBotAllowlist_GroupIsolation(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	if _, err := s.AllowBot(ctx, -1, 777, "b", 1, time.Unix(1, 0)); err != nil {
+		t.Fatal(err)
+	}
+	g1, _ := s.ListAllowedBots(ctx, -1)
+	g2, _ := s.ListAllowedBots(ctx, -2)
+	if len(g1) != 1 {
+		t.Errorf("group -1 should have 1 entry, got %d", len(g1))
+	}
+	if len(g2) != 0 {
+		t.Errorf("group -2 must not see group -1's allowlist, got %d", len(g2))
+	}
+}
+
+func TestGuestViolations_IncrementAndGet(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+
+	if n, err := s.GetGuestViolation(ctx, -1, 9); err != nil || n != 0 {
+		t.Fatalf("initial GetGuestViolation = %d, %v; want 0, nil", n, err)
+	}
+	for want := int64(1); want <= 3; want++ {
+		got, err := s.IncrementGuestViolation(ctx, -1, 9)
+		if err != nil {
+			t.Fatalf("increment: %v", err)
+		}
+		if got != want {
+			t.Errorf("increment #%d returned %d, want %d", want, got, want)
+		}
+	}
+	if n, _ := s.GetGuestViolation(ctx, -1, 9); n != 3 {
+		t.Errorf("GetGuestViolation = %d, want 3", n)
+	}
+	// Different (group,user) keys are independent.
+	if n, _ := s.IncrementGuestViolation(ctx, -2, 9); n != 1 {
+		t.Errorf("other group counter = %d, want 1", n)
+	}
+}
+
+func TestDeleteBinding_CascadesAllowlistAndViolations(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	if _, _, err := s.UpsertBinding(ctx, Binding{GroupChatID: -1, ChannelChatID: -10, BoundAt: time.Unix(1, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = s.AllowBot(ctx, -1, 555, "b", 1, time.Unix(1, 0))
+	_, _ = s.IncrementGuestViolation(ctx, -1, 9)
+
+	removed, err := s.DeleteBinding(ctx, -1)
+	if err != nil || !removed {
+		t.Fatalf("DeleteBinding = %v, %v", removed, err)
+	}
+	if got, _ := s.ListAllowedBots(ctx, -1); len(got) != 0 {
+		t.Errorf("allowlist not cascaded on unbind: %+v", got)
+	}
+	if n, _ := s.GetGuestViolation(ctx, -1, 9); n != 0 {
+		t.Errorf("violation count not cascaded on unbind: %d", n)
+	}
+}
+
+func TestGroupBotAllowlist_SurvivesReopen(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "reopen.db")
+
+	s1, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := s1.AllowBot(ctx, -1, 555, "b", 1, time.Unix(1, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s1.IncrementGuestViolation(ctx, -1, 9); err != nil {
+		t.Fatal(err)
+	}
+	_ = s1.Close()
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer func() { _ = s2.Close() }()
+	if got, _ := s2.ListAllowedBots(ctx, -1); len(got) != 1 {
+		t.Errorf("allowlist did not survive reopen: %+v", got)
+	}
+	if n, _ := s2.GetGuestViolation(ctx, -1, 9); n != 1 {
+		t.Errorf("violation count did not survive reopen: %d", n)
+	}
+}

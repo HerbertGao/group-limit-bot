@@ -65,7 +65,9 @@ func newHandlerHarnessRaw(t *testing.T, groupID, channelID int64, memberStatus t
 	}
 	lookup := &runtimeStoreLookup{st: st}
 	gate := gating.New(lookup, cache, dedup, mock, reg, log, cfg)
-	exec := gating.NewExecutor(mock, reg, log)
+	exec := gating.NewExecutor(mock, reg, log, st, gating.GuestPunishPolicy{
+		MuteThreshold: 2, BanThreshold: 4, MuteDuration: time.Hour,
+	})
 
 	h := &handlerHarness{gate: gate, exec: exec, disp: disp, mock: mock, log: log}
 	disp.Register("probe", func(ctx context.Context, msg *telego.Message, args string) error {

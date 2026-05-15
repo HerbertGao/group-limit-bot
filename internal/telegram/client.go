@@ -88,7 +88,28 @@ type Client interface {
 	DeleteMessage(ctx context.Context, chatID int64, messageID int) error
 	SendMessage(ctx context.Context, chatID int64, text string, markdownV2 bool) (int, error)
 	GetChat(ctx context.Context, chatID int64) (*ChatInfo, error)
+	// ResolveUsername resolves an @username (with or without leading @) to chat info.
+	ResolveUsername(ctx context.Context, username string) (*ChatInfo, error)
+	// RestrictChatMember mutes userID in chatID until the given time (zero = forever).
+	RestrictChatMember(ctx context.Context, chatID, userID int64, until time.Time) error
+	// BanChatMember bans userID from chatID permanently.
+	BanChatMember(ctx context.Context, chatID, userID int64) error
 	DeleteWebhook(ctx context.Context) error
+}
+
+// IsMessageNotFound reports whether err is a Telegram "message to delete not
+// found" / "message can't be deleted" class error — expected when a message
+// was already removed (e.g. a summon already deleted by the gating pipeline).
+func IsMessageNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr *telegoapi.Error
+	if errors.As(err, &apiErr) && apiErr.ErrorCode == 400 {
+		d := strings.ToLower(apiErr.Description)
+		return strings.Contains(d, "not found") || strings.Contains(d, "message can't be deleted")
+	}
+	return false
 }
 
 // RateLimitError is returned when we are actively backing off a chat due to 429.
@@ -306,6 +327,59 @@ func (c *TelegoClient) GetChat(ctx context.Context, chatID int64) (*ChatInfo, er
 		Username:     full.Username,
 		LinkedChatID: full.LinkedChatID,
 	}, nil
+}
+
+func (c *TelegoClient) ResolveUsername(ctx context.Context, username string) (*ChatInfo, error) {
+	if err := c.acquire(ctx, 0); err != nil {
+		return nil, err
+	}
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+	uname := "@" + strings.TrimPrefix(strings.TrimSpace(username), "@")
+	full, err := c.bot.GetChat(ctx, &telego.GetChatParams{ChatID: telego.ChatID{Username: uname}})
+	if err != nil {
+		return nil, c.handleAPIError(0, err)
+	}
+	return &ChatInfo{
+		ID:           full.ID,
+		Type:         full.Type,
+		Title:        full.Title,
+		Username:     full.Username,
+		LinkedChatID: full.LinkedChatID,
+	}, nil
+}
+
+func (c *TelegoClient) RestrictChatMember(ctx context.Context, chatID, userID int64, until time.Time) error {
+	if err := c.acquire(ctx, chatID); err != nil {
+		return err
+	}
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+	var untilDate int64
+	if !until.IsZero() {
+		untilDate = until.Unix()
+	}
+	// Zero-valued ChatPermissions => every permission denied (fully muted).
+	err := c.bot.RestrictChatMember(ctx, &telego.RestrictChatMemberParams{
+		ChatID:      telego.ChatID{ID: chatID},
+		UserID:      userID,
+		Permissions: telego.ChatPermissions{},
+		UntilDate:   untilDate,
+	})
+	return c.handleAPIError(chatID, err)
+}
+
+func (c *TelegoClient) BanChatMember(ctx context.Context, chatID, userID int64) error {
+	if err := c.acquire(ctx, chatID); err != nil {
+		return err
+	}
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+	err := c.bot.BanChatMember(ctx, &telego.BanChatMemberParams{
+		ChatID: telego.ChatID{ID: chatID},
+		UserID: userID,
+	})
+	return c.handleAPIError(chatID, err)
 }
 
 func (c *TelegoClient) DeleteWebhook(ctx context.Context) error {
