@@ -70,7 +70,7 @@ func (s *Service) Bind(ctx context.Context, groupChat *telegram.ChatInfo, caller
 	// Check bot is admin in linked channel.
 	botStatus, err := s.tg.GetChatMember(ctx, full.LinkedChatID, s.tg.Me().ID)
 	if err != nil {
-		if isTransientAPIErr(err) {
+		if telegram.IsTransient(err) {
 			return nil, fmt.Errorf("check bot admin in channel: %w", err)
 		}
 		return nil, ErrBotNotChannelAdmin
@@ -82,7 +82,7 @@ func (s *Service) Bind(ctx context.Context, groupChat *telegram.ChatInfo, caller
 	// Check bot can delete messages in the discussion group.
 	canDelete, err := s.tg.GetChatMemberCanDelete(ctx, groupChat.ID, s.tg.Me().ID)
 	if err != nil {
-		if isTransientAPIErr(err) {
+		if telegram.IsTransient(err) {
 			return nil, fmt.Errorf("check bot moderate group: %w", err)
 		}
 		return nil, ErrBotCannotModerateGroup
@@ -142,22 +142,4 @@ func (s *Service) Unbind(ctx context.Context, groupID int64, callerUserID int64)
 // Fast path for gating; no permission checks.
 func (s *Service) Lookup(ctx context.Context, groupID int64) (*store.Binding, error) {
 	return s.store.GetBinding(ctx, groupID)
-}
-
-// isTransientAPIErr reports whether err is a transient Telegram error we should
-// bubble up (429 rate limit, timeout, cancellation). All other errors during a
-// bot self-check indicate a permissions/access problem and should be surfaced as
-// the corresponding Err* sentinel.
-func isTransientAPIErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	var rle *telegram.RateLimitError
-	if errors.As(err, &rle) {
-		return true
-	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return true
-	}
-	return false
 }

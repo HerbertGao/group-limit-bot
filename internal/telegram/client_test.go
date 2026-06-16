@@ -3,14 +3,66 @@ package telegram
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/mymmrac/telego"
+	"github.com/mymmrac/telego/telegoapi"
 	"golang.org/x/time/rate"
 )
+
+// TestIsTransient guards the regression that motivated this classifier: a
+// fasthttp transport timeout is NOT context.DeadlineExceeded, so the old logic
+// treated every network hiccup as a definitive permission failure (selfcheck
+// spammed every group; /bind wrongly reported "bot is not admin").
+func TestIsTransient(t *testing.T) {
+	transient := []struct {
+		name string
+		err  error
+	}{
+		{"rate limit", &RateLimitError{ChatID: 1, RetryAfter: time.Second}},
+		{"context deadline", context.DeadlineExceeded},
+		{"context canceled", context.Canceled},
+		{"fasthttp timeout", errors.New("telego: getChatMember: internal execution: request call: fasthttp do request: timeout")},
+		{"connection reset", errors.New("fasthttp do request: connection reset by peer")},
+		// telego's FastHTTPCaller surfaces HTTP 5xx as this plain string, never a *telegoapi.Error.
+		{"server 5xx", errors.New("internal server error: 502")},
+		{"wrapped 429 api error", fmt.Errorf("call: %w", &telegoapi.Error{ErrorCode: 429, Description: "Too Many Requests"})},
+	}
+	for _, tc := range transient {
+		t.Run(tc.name, func(t *testing.T) {
+			if !IsTransient(tc.err) {
+				t.Errorf("expected %q to be transient", tc.name)
+			}
+		})
+	}
+
+	definitive := []struct {
+		name string
+		err  error
+	}{
+		{"chat not found", &telegoapi.Error{ErrorCode: 400, Description: "Bad Request: chat not found"}},
+		{"bot kicked", fmt.Errorf("call: %w", &telegoapi.Error{ErrorCode: 403, Description: "Forbidden: bot was kicked from the supergroup chat"})},
+		// A definitive 4xx must stay definitive even when an outer wrapping mentions
+		// "timeout" — guards against any future naive string-matching shortcut.
+		{"4xx wrapped with timeout-ish text", fmt.Errorf("getChatMember timeout: %w", &telegoapi.Error{ErrorCode: 400, Description: "chat not found"})},
+	}
+	for _, tc := range definitive {
+		t.Run(tc.name, func(t *testing.T) {
+			if IsTransient(tc.err) {
+				t.Errorf("expected %q to be a definitive (non-transient) signal", tc.name)
+			}
+		})
+	}
+
+	// nil is no error at all, not a transient failure.
+	if IsTransient(nil) {
+		t.Error("nil error must not be classified transient")
+	}
+}
 
 // newTestClient builds a TelegoClient without touching the network.
 // Only the fields exercised by acquire() are populated.

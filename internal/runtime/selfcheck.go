@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -12,23 +11,6 @@ import (
 	"github.com/herbertgao/group-limit-bot/internal/store"
 	"github.com/herbertgao/group-limit-bot/internal/telegram"
 )
-
-// isTransient reports whether an error from Telegram API calls should be
-// treated as a temporary/retryable condition (rate limits, deadlines,
-// cancellation) rather than a degradation signal worth alerting on.
-func isTransient(err error) bool {
-	if err == nil {
-		return true
-	}
-	var rle *telegram.RateLimitError
-	if errors.As(err, &rle) {
-		return true
-	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return true
-	}
-	return false
-}
 
 // SelfCheck periodically verifies the bot is still an admin in every bound channel.
 // When a binding has become degraded, it posts a single warning message to the
@@ -110,7 +92,7 @@ func (sc *SelfCheck) tick(ctx context.Context) {
 func (sc *SelfCheck) checkBinding(ctx context.Context, b store.Binding, botID int64) (reasons []string, channelOK, groupOK bool) {
 	status, err := sc.tg.GetChatMember(ctx, b.ChannelChatID, botID)
 	switch {
-	case err != nil && isTransient(err):
+	case err != nil && telegram.IsTransient(err):
 		sc.log.Warn("selfcheck: transient error on channel",
 			slog.Int64("channel_id", b.ChannelChatID),
 			slog.String("error", err.Error()),
@@ -128,7 +110,7 @@ func (sc *SelfCheck) checkBinding(ctx context.Context, b store.Binding, botID in
 	}
 	canDelete, gErr := sc.tg.GetChatMemberCanDelete(ctx, b.GroupChatID, botID)
 	switch {
-	case gErr != nil && isTransient(gErr):
+	case gErr != nil && telegram.IsTransient(gErr):
 		sc.log.Warn("selfcheck: transient error on group",
 			slog.Int64("group_id", b.GroupChatID),
 			slog.String("error", gErr.Error()),
