@@ -122,6 +122,37 @@ func (e *RateLimitError) Error() string {
 	return fmt.Sprintf("rate limited for chat %d, retry after %s", e.ChatID, e.RetryAfter)
 }
 
+// IsTransient reports whether a non-nil error from a Telegram API call should
+// be treated as a temporary/unknown condition (rate limit, network timeout,
+// connection failure, server error) rather than a definitive answer from
+// Telegram about the bot's access to a chat.
+//
+// Only a parsed error *response* from Telegram (a *telegoapi.Error such as a 4xx
+// "chat not found" / "bot was kicked") definitively indicates a permission or
+// access problem. Every transport-level failure — fasthttp/network timeouts
+// (e.g. "fasthttp do request: timeout"), connection resets, DNS errors, EOF,
+// HTTP 5xx (surfaced as a plain "internal server error: N" string by telego's
+// FastHTTPCaller), context deadline/cancel — tells us nothing about the bot's
+// permissions and is transient. A 429 is normally converted to *RateLimitError
+// upstream by handleAPIError, but is treated as transient here too for safety.
+//
+// Callers must apply this only to a non-nil error; nil (no error) is reported
+// as not transient.
+func IsTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	var rle *RateLimitError
+	if errors.As(err, &rle) {
+		return true
+	}
+	var apiErr *telegoapi.Error
+	if errors.As(err, &apiErr) {
+		return apiErr.ErrorCode == 429
+	}
+	return true
+}
+
 // TelegoClient wraps *telego.Bot with a global token bucket and per-chat 429 backoff.
 type TelegoClient struct {
 	bot     *telego.Bot

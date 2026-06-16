@@ -9,6 +9,7 @@ import (
 
 	"github.com/herbertgao/group-limit-bot/internal/store"
 	"github.com/herbertgao/group-limit-bot/internal/telegram"
+	"github.com/mymmrac/telego/telegoapi"
 )
 
 const (
@@ -314,7 +315,9 @@ func TestBind_APIFailureOnChannelCheckReportsBotNotChannelAdmin(t *testing.T) {
 		case chatID == groupID && userID == adminID:
 			return telegram.StatusCreator, nil
 		case chatID == channelID && userID == botID:
-			return telegram.StatusUnknown, errors.New("forbidden: bot not a member")
+			// A definitive Telegram rejection surfaces as a *telegoapi.Error, not a
+			// transport-shaped error — that is what marks it non-transient.
+			return telegram.StatusUnknown, &telegoapi.Error{ErrorCode: 403, Description: "Forbidden: bot is not a member of the channel chat"}
 		}
 		return telegram.StatusUnknown, nil
 	}
@@ -350,7 +353,8 @@ func TestBind_APIFailureOnGroupCheckReportsCannotModerate(t *testing.T) {
 	}
 	mock.GetChatMemberCanDeleteFn = func(ctx context.Context, chatID, userID int64) (bool, error) {
 		if chatID == groupID && userID == botID {
-			return false, errors.New("bad request: chat_admin_required")
+			// Definitive Telegram rejection (a parsed API error), not transport noise.
+			return false, &telegoapi.Error{ErrorCode: 400, Description: "Bad Request: not enough rights to manage chat"}
 		}
 		return true, nil
 	}
@@ -400,5 +404,38 @@ func TestBind_TransientChannelCheckErrorBubbles(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "check bot admin in channel") {
 		t.Errorf("expected wrapped message containing 'check bot admin in channel', got %v", err)
+	}
+}
+
+// TestBind_NetworkTimeoutChannelCheckBubbles pins the regression: a fasthttp
+// transport timeout during /bind must bubble as a transient error, not be
+// misreported as ErrBotNotChannelAdmin to the group creator.
+func TestBind_NetworkTimeoutChannelCheckBubbles(t *testing.T) {
+	svc, mock := newServiceWithMock(t)
+	mock.GetChatMemberFn = func(ctx context.Context, chatID, userID int64) (telegram.Status, error) {
+		switch {
+		case chatID == groupID && userID == adminID:
+			return telegram.StatusCreator, nil
+		case chatID == channelID && userID == botID:
+			return telegram.StatusUnknown, errors.New("telego: getChatMember: internal execution: request call: fasthttp do request: timeout")
+		}
+		return telegram.StatusUnknown, nil
+	}
+	mock.GetChatFn = func(ctx context.Context, chatID int64) (*telegram.ChatInfo, error) {
+		switch chatID {
+		case groupID:
+			return &telegram.ChatInfo{ID: groupID, Type: "supergroup", Title: "讨论群", LinkedChatID: channelID}, nil
+		case channelID:
+			return &telegram.ChatInfo{ID: channelID, Type: "channel", Title: "主频道"}, nil
+		}
+		return nil, nil
+	}
+
+	_, err := svc.Bind(context.Background(), groupChatInfo(), adminID)
+	if errors.Is(err, ErrBotNotChannelAdmin) {
+		t.Errorf("network timeout must not be reported as ErrBotNotChannelAdmin: %v", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "check bot admin in channel") {
+		t.Errorf("expected wrapped transient error, got %v", err)
 	}
 }
