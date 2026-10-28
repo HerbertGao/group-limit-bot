@@ -18,7 +18,8 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v7
       with:
-        go-version: '1.25'
+        # setup-go sets GOTOOLCHAIN=local, so this must match the go line.
+        go-version-file: go.mod
 
     - name: Cache Go modules
       uses: actions/cache@v6
@@ -59,7 +60,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v7
       with:
-        go-version: '1.25'
+        go-version-file: go.mod
 
     - name: Run go vet
       run: go vet ./...
@@ -81,7 +82,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v7
       with:
-        go-version: '1.25'
+        go-version-file: go.mod
 
     - name: Build
       run: |
